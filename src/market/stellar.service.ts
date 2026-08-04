@@ -41,6 +41,7 @@ export class StellarService {
   private readonly logger = new Logger(StellarService.name);
   readonly server: rpc.Server;
   private readonly keypair: Keypair;
+  private readonly secretKey: string;
   readonly networkPassphrase: string;
   readonly rpcUrl: string;
 
@@ -49,6 +50,7 @@ export class StellarService {
     if (!secret) {
       throw new Error('ORACLE_SECRET_KEY is required to start polaris-oracle');
     }
+    this.secretKey = secret;
     this.keypair = Keypair.fromSecret(secret);
     this.networkPassphrase = this.config.get<string>('stellarNetworkPassphrase')!;
     this.rpcUrl = this.config.get<string>('stellarRpcUrl')!;
@@ -147,9 +149,19 @@ export class StellarService {
   // downstream of a market existing (buy/sell/settle/cancel/redeem) is
   // exercised in-process and unit-tested; this one path trades a small
   // amount of deploy-time robustness (see the contracts repo's Fly.io
-  // gotchas: `libdbus-1-3`, CLI identity provisioning) for correctness
-  // confidence on the piece most likely to silently misbehave if hand-rolled
-  // blind.
+  // gotchas: `libdbus-1-3`) for correctness confidence on the piece most
+  // likely to silently misbehave if hand-rolled blind.
+  //
+  // `--source` is passed the raw secret directly (the CLI accepts a secret
+  // key or seed phrase as an alternative to a named identity) rather than a
+  // separately-provisioned "deployer" identity: `initialize`'s `admin`
+  // parameter is set to this same key's public address below, and
+  // `admin.require_auth()` needs whichever key signs this transaction to
+  // match it. Using one keypair for both online settlement and deployment
+  // also means there's no `DEPLOYER_SEED_PHRASE` to provision at container
+  // startup — one less moving part than a separate cold deploy key would
+  // need, appropriate for a testnet build (a production deployment with
+  // real value at stake would reasonably want these separated again).
   async deployMarket(params: CreateMarketParams): Promise<{ contractId: string; initTxHash: string }> {
     const network = this.config.get<string>('stellarNetwork')!;
     const deploy = await execFileAsync('stellar', [
@@ -158,7 +170,7 @@ export class StellarService {
       '--wasm',
       'wasm/polaris_market.wasm',
       '--source',
-      'deployer',
+      this.secretKey,
       '--network',
       network,
       '--rpc-url',
@@ -175,7 +187,7 @@ export class StellarService {
       '--id',
       contractId,
       '--source',
-      'deployer',
+      this.secretKey,
       '--network',
       network,
       '--rpc-url',

@@ -20,7 +20,7 @@ export class CreateMarketDto {
   @Min(0)
   feeBps!: number;
 
-  /** Collateral pulled from the deployer to seed the AMM pool, in stroops. */
+  /** Collateral pulled from the oracle keypair to seed the AMM pool, in stroops. */
   @IsNumberString()
   initialLiquidityStroops!: string;
 }

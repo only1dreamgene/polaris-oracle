@@ -2,7 +2,6 @@ export interface AppConfig {
   port: number;
   oracleSecretKey: string;
   adminApiKey: string;
-  deployerSeedPhrase: string | undefined;
   pythLazerToken: string | undefined;
   pythLazerWsUrl: string;
   pythHermesUrl: string;
@@ -29,7 +28,6 @@ export default (): AppConfig => ({
   port: Number(process.env.PORT ?? 3000),
   oracleSecretKey: process.env.ORACLE_SECRET_KEY ?? '',
   adminApiKey: process.env.ADMIN_API_KEY ?? '',
-  deployerSeedPhrase: process.env.DEPLOYER_SEED_PHRASE,
   pythLazerToken: process.env.PYTH_LAZER_TOKEN,
   pythLazerWsUrl: process.env.PYTH_LAZER_WS_URL ?? 'wss://pyth-lazer.dourolabs.app/v1/stream',
   pythHermesUrl: process.env.PYTH_HERMES_URL ?? 'https://hermes.pyth.network',
