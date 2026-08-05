@@ -1,4 +1,4 @@
-import { contract as StellarContract } from '@stellar/stellar-sdk';
+import { contract as StellarContract, type xdr } from '@stellar/stellar-sdk';
 
 /**
  * JSON-transportable argument values from an HTTP request body: plain
@@ -8,6 +8,52 @@ import { contract as StellarContract } from '@stellar/stellar-sdk';
  * the `Prediction` enum tag).
  */
 export type WireArgs = Record<string, string | number>;
+
+/**
+ * Which parameter each sponsorable function's authorizing address is bound
+ * to — `transfer` calls it `from` (there's a second, unrelated `to`
+ * address in that call); every other function calls it `user`. This isn't
+ * cosmetic: `coerceWireArgs` silently *skips* any parameter absent from
+ * `wireArgs` rather than erroring, so if a caller forgets to include the
+ * address under this exact key, the resulting call doesn't fail loudly —
+ * it quietly builds with `scvVoid` where an `Address` belongs, and breaks
+ * downstream instead (verified against `spec.js`, not assumed). An earlier
+ * version of this system's callers never included the address at all,
+ * which would have broken every trade end-to-end; see
+ * `wire-args.spec.ts` for the regression test.
+ */
+export const AUTH_ADDRESS_PARAM: Record<string, string> = {
+  buy: 'user',
+  sell: 'user',
+  split: 'user',
+  merge: 'user',
+  redeem: 'user',
+  transfer: 'from',
+};
+
+export const SPONSORABLE_FUNCTIONS = Object.keys(AUTH_ADDRESS_PARAM);
+
+/**
+ * Builds the exact `xdr.ScVal[]` a sponsored call to `functionName` needs,
+ * with `walletAddress` injected under whichever parameter actually
+ * authorizes the call (see `AUTH_ADDRESS_PARAM`) — the single choke point
+ * both `prepare()` and `submit()` go through, so the address-injection
+ * logic only exists once and is directly unit-testable without any RPC
+ * mocking at all.
+ */
+export function buildSponsoredCallArgs(
+  spec: StellarContract.Spec,
+  functionName: string,
+  walletAddress: string,
+  wireArgs: WireArgs,
+): xdr.ScVal[] {
+  const addressParam = AUTH_ADDRESS_PARAM[functionName];
+  if (!addressParam) {
+    throw new Error(`${functionName} is not a sponsorable function`);
+  }
+  const args = coerceWireArgs(spec, functionName, { ...wireArgs, [addressParam]: walletAddress });
+  return spec.funcArgsToScVals(functionName, args);
+}
 
 /**
  * Converts wire-format args into whatever `contract.Spec.funcArgsToScVals`

@@ -111,6 +111,7 @@ export class MarketService implements OnModuleInit {
       this.logger.log(`settled ${m.contractId} in tx ${txHash}`);
     } catch (err) {
       const message = (err as Error).message;
+      if (await this.reconcileWithChain(m)) return;
       this.logger.error(`settle failed for ${m.contractId}: ${message}`);
       this.persist(m, { status: 'pending', lastError: message });
       this.scheduleCancelFallback(m);
@@ -127,14 +128,47 @@ export class MarketService implements OnModuleInit {
       this.logger.log(`cancelled ${m.contractId} in tx ${txHash}`);
     } catch (err) {
       const message = (err as Error).message;
+      if (await this.reconcileWithChain(m)) return;
       // Cancel is permissionless and idempotent-safe on-chain (a second
-      // call after it's already Cancelled/Resolved just errors) — if this
-      // was "already resolved by someone else", that's success, not a
-      // failure to retry. Anything else, log and leave status as-is; an
-      // admin can retry via /markets/:id/cancel.
+      // call after it's already Cancelled/Resolved just errors) — that case
+      // is exactly what reconcileWithChain catches above. Anything else,
+      // log and leave status as-is; an admin can retry via /markets/:id/cancel.
       this.logger.error(`cancel failed for ${m.contractId}: ${message}`);
       this.persist(m, { status: 'pending', lastError: message });
     }
+  }
+
+  /**
+   * A `settle`/`cancel` call can fail locally (crash, network blip) *after*
+   * the on-chain transaction already succeeded — the call that later
+   * re-attempts it then fails too, but with a misleading "AlreadyFinalized"
+   * error, and without this check that failure would get persisted as
+   * `status: 'pending'` forever. This is purely a tracking-DB correctness
+   * fix, not a funds-safety one: the contract itself was never at risk
+   * either way, only what this service *reports* about it. Before
+   * recording a failure as real, check whether the market is actually
+   * already finalized on-chain and, if so, sync local status to match
+   * instead. Returns true if it reconciled (caller should stop, not persist
+   * a failure).
+   */
+  private async reconcileWithChain(m: WatchedMarket): Promise<boolean> {
+    let state;
+    try {
+      state = await this.stellar.getMarketState(m.contractId);
+    } catch {
+      return false; // can't tell — fall through to the normal failure path
+    }
+    if (state.status === 'ResolvedYes' || state.status === 'ResolvedNo') {
+      this.persist(m, { status: 'settled', lastError: undefined });
+      this.logger.warn(`${m.contractId} was already settled on-chain — reconciled local status`);
+      return true;
+    }
+    if (state.status === 'Cancelled') {
+      this.persist(m, { status: 'cancelled', lastError: undefined });
+      this.logger.warn(`${m.contractId} was already cancelled on-chain — reconciled local status`);
+      return true;
+    }
+    return false;
   }
 
   private persist(m: WatchedMarket, patch: Partial<WatchedMarket>): void {

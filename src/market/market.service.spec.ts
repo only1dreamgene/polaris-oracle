@@ -19,6 +19,21 @@ function makeRepo(): MarketRepository {
   } as unknown as MarketRepository;
 }
 
+/**
+ * Flushes pending microtasks — needed because `trySettle`/`tryCancel`'s
+ * fire-and-forget async chains (`void this.trySettle(m)`) run detached from
+ * the test's own await chain. A fixed number of `await Promise.resolve()`
+ * calls is fragile: it silently under-flushes (and the test starts failing
+ * on an unrelated assertion, as happened here) whenever a code path grows
+ * one more `await` hop, e.g. when `reconcileWithChain` was added. Looping
+ * until nothing is scheduled anymore doesn't have that failure mode.
+ */
+async function flushMicrotasks(iterations = 20): Promise<void> {
+  for (let i = 0; i < iterations; i++) {
+    await Promise.resolve();
+  }
+}
+
 function sample(overrides: Partial<WatchedMarket> = {}): WatchedMarket {
   const now = Date.now();
   return {
@@ -43,9 +58,7 @@ describe('MarketService — settlement orchestration', () => {
 
     const m = svc.watch(sample());
     // watch() arms synchronously via a microtask chain (now >= expiry, < grace end) — flush it.
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    await flushMicrotasks();
 
     expect(stellar.settle).toHaveBeenCalledWith('CCONTRACT1', Buffer.from('payload'));
     expect(svc.get(m.contractId)?.status).toBe('settled');
@@ -63,14 +76,13 @@ describe('MarketService — settlement orchestration', () => {
 
       const m = sample({ gracePeriodSecs: 60 });
       svc.watch(m);
-      await Promise.resolve();
+      await flushMicrotasks();
 
       expect(stellar.settle).not.toHaveBeenCalled();
       expect(svc.get(m.contractId)?.status).toBe('watching'); // fallback scheduled, not yet fired
 
       jest.advanceTimersByTime(60_000 + 1000);
-      await Promise.resolve();
-      await Promise.resolve();
+      await flushMicrotasks();
 
       expect(stellar.cancel).toHaveBeenCalledWith('CCONTRACT1');
       expect(svc.get(m.contractId)?.status).toBe('cancelled');
@@ -86,28 +98,68 @@ describe('MarketService — settlement orchestration', () => {
       const stellar = {
         settle: jest.fn().mockRejectedValue(new Error('rpc exploded')),
         cancel: jest.fn().mockResolvedValue('CANCELTX'),
+        getMarketState: jest.fn().mockRejectedValue(new Error('rpc down too')),
       };
       const oracle = { isAvailable: true, waitForUpdate: jest.fn().mockResolvedValue(Buffer.from('x')) };
       const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService);
 
       const m = sample({ gracePeriodSecs: 60 });
       svc.watch(m);
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
+      await flushMicrotasks();
 
       expect(svc.get(m.contractId)?.status).toBe('pending');
       expect(svc.get(m.contractId)?.lastError).toMatch(/rpc exploded/);
 
       jest.advanceTimersByTime(60_000 + 1000);
-      await Promise.resolve();
-      await Promise.resolve();
+      await flushMicrotasks();
 
       expect(stellar.cancel).toHaveBeenCalled();
       expect(svc.get(m.contractId)?.status).toBe('cancelled');
     } finally {
       jest.useRealTimers();
     }
+  });
+
+  it('reconciles instead of stranding status as "pending" when settle failed locally but had already succeeded on-chain', async () => {
+    // Models a crash between the on-chain settle tx confirming and this
+    // service persisting that fact: the retry's settle() call fails
+    // (AlreadyFinalized on-chain), but the market is actually fine — status
+    // must sync to 'settled', not get stuck reporting a failure forever.
+    const repo = makeRepo();
+    const stellar = {
+      settle: jest.fn().mockRejectedValue(new Error('AlreadyFinalized')),
+      cancel: jest.fn(),
+      getMarketState: jest.fn().mockResolvedValue({ status: 'ResolvedYes' }),
+    };
+    const oracle = { isAvailable: true, waitForUpdate: jest.fn().mockResolvedValue(Buffer.from('x')) };
+    const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService);
+
+    const m = sample({ gracePeriodSecs: 60 });
+    svc.watch(m);
+    await flushMicrotasks();
+
+    expect(svc.get(m.contractId)?.status).toBe('settled');
+    expect(svc.get(m.contractId)?.lastError).toBeUndefined();
+    expect(stellar.cancel).not.toHaveBeenCalled(); // no bogus fallback scheduled once reconciled
+  });
+
+  it('reconciles instead of stranding status as "pending" when cancel failed locally but had already succeeded on-chain', async () => {
+    const repo = makeRepo();
+    const stellar = {
+      settle: jest.fn(),
+      cancel: jest.fn().mockRejectedValue(new Error('AlreadyFinalized')),
+      getMarketState: jest.fn().mockResolvedValue({ status: 'Cancelled' }),
+    };
+    const oracle = { isAvailable: true, waitForUpdate: jest.fn() };
+    const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService);
+
+    const m = sample({ status: 'pending' });
+    repo.upsert(m);
+
+    await svc.triggerCancel(m.contractId);
+
+    expect(svc.get(m.contractId)?.status).toBe('cancelled');
+    expect(svc.get(m.contractId)?.lastError).toBeUndefined();
   });
 
   it('does not re-settle or re-cancel an already-finalized market', async () => {

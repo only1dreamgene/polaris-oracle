@@ -19,18 +19,49 @@ See `../polaris-contracts/README.md` for the on-chain half of this system.
 | `admin.guard.ts` | `x-admin-key` check, constant-time compare, fails closed if unset. |
 | `faucet.service.ts` | Rate-limited (3/hour/address) Friendbot funding. |
 | `contracts.ts` | Loads `wasm/*.wasm` and parses each contract's real spec via `contract.Spec.fromWasm` — argument/return encoding for custom types (the `Prediction` enum, the `Market`/`Signature` structs) comes from the compiled contract, not from guessing the wire format. |
+| `wire-args.ts` | Converts JSON-transportable request args into `xdr.ScVal[]`, and — the part that actually matters — injects the wallet's own address into whichever parameter authorizes each sponsored call. See "Bugs found by pressure-testing" below. |
 
-## A decoding bug worth knowing about
+## Bugs found by pressure-testing this system
 
-`contract.Spec` (used to decode every contract read) preserves the Rust
-struct's exact field names (snake_case) and represents enums as
+Three real bugs surfaced by deliberately trying to break this system after
+it was "done," not just written once and left. Recorded here because each
+one is the kind of thing that looks fine in a code read and only shows up
+under adversarial pressure or a real failure:
+
+1. **Every sponsored trade call was missing its own address.** `wireArgs`
+   only ever carried what the frontend explicitly passed (`prediction`,
+   `collateral_amount`, ...) — the wallet's address was never included, and
+   `coerceWireArgs` silently *skips* any parameter absent from its input
+   rather than erroring. This didn't crash loudly; it would have made
+   `AuthRelayService.prepare` fail to find any authorization entry to sign,
+   breaking `buy`/`sell`/`split`/`merge`/`redeem`/`transfer` end to end.
+   Fixed by extracting the argument-building into `wire-args.ts`'s
+   `buildSponsoredCallArgs`, which injects the address explicitly (derived
+   from the *signed entry itself* in `submit()`, not a client-supplied
+   field, so it can't drift or be spoofed) — and is directly unit-tested
+   (`wire-args.spec.ts`) without any RPC mocking, specifically so this
+   class of bug fails a test instead of silently shipping.
+2. **`contract.Spec` decodes structs/enums as raw Rust shapes**, not
+   camelCase strings — `getMarketState` was casting the raw decode result
+   straight to the REST-facing type, which would have served wrong field
+   names and an unusable status shape. Fixed with an explicit
+   `normalizeMarket` translation in `stellar.service.ts`.
+3. **A crash between an on-chain `settle`/`cancel` succeeding and this
+   service persisting that fact would strand the tracked status as
+   `'pending'` forever** — the retry's call fails on-chain
+   (`AlreadyFinalized`), and nothing reconciled that against the
+   possibility that it failed *because it had already worked*. Not a
+   funds-safety bug (the contract was never at risk either way), but a real
+   observability one: the admin console and dashboard would show a
+   perfectly fine market as stuck. Fixed with `reconcileWithChain` in
+   `market.service.ts`, which checks live on-chain state before recording
+   a settle/cancel failure as real.
+
+Worth knowing if you add a new on-chain read: `contract.Spec` preserves the
+Rust struct's exact field names (snake_case) and represents enums as
 `{ tag: 'Open' }` rather than a bare string — it does **not** camelCase
-anything. An early version of `getMarketState` cast the raw decode result
-straight to the REST-facing `OnChainMarket` type and would have silently
-served wrong field names and an unusable status shape to every client. Now
-fixed by an explicit `normalizeMarket` translation in `stellar.service.ts`,
-verified against `spec.js`'s actual decode logic rather than assumed —
-worth knowing if you add a new on-chain read and reach for the same cast.
+anything, so casting a raw decode result straight to a REST-facing type
+(the mistake bug 2 was) is an easy trap to fall back into.
 
 ## Why native XLM, no custom test token
 
@@ -76,7 +107,7 @@ against. Treat the relay as unverified until run against testnet.
 cp .env.example .env   # fill in ORACLE_SECRET_KEY, ADMIN_API_KEY at minimum
 npm install
 npm run start:dev      # http://localhost:3001
-npm test                # 33 unit tests
+npm test                # 42 unit tests
 ```
 
 `ORACLE_SECRET_KEY` is the only hard requirement to boot — everything else

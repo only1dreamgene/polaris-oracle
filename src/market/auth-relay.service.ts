@@ -1,7 +1,6 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
-  Address,
   BASE_FEE,
   Contract,
   Keypair,
@@ -15,7 +14,7 @@ import {
   xdr,
 } from '@stellar/stellar-sdk';
 import { marketSpec } from './contracts';
-import { coerceWireArgs, type WireArgs } from './wire-args';
+import { buildSponsoredCallArgs, type WireArgs } from './wire-args';
 
 export interface PrepareAuthResult {
   entryXdr: string;
@@ -82,8 +81,7 @@ export class AuthRelayService {
     functionName: string,
     wireArgs: WireArgs,
   ): Promise<PrepareAuthResult> {
-    const args = coerceWireArgs(marketSpec, functionName, wireArgs);
-    const scArgs = marketSpec.funcArgsToScVals(functionName, args);
+    const scArgs = buildSponsoredCallArgs(marketSpec, functionName, walletAddress, wireArgs);
     const op = new Contract(contractId).call(functionName, ...scArgs);
 
     const sourceAccount = await this.server.getAccount(this.keypair.publicKey());
@@ -137,6 +135,15 @@ export class AuthRelayService {
   ): Promise<{ txHash: string }> {
     const unsignedEntry = xdr.SorobanAuthorizationEntry.fromXDR(entryXdr, 'base64');
 
+    // Read the authorizing address back out of the entry itself rather than
+    // trust a client-supplied field for it: the entry is what's actually
+    // being signed and submitted, so it's the one value here that can't be
+    // spoofed or drift out of sync with what the passkey approved.
+    const walletAddress = inspectAuthEntry(unsignedEntry).address;
+    if (!walletAddress) {
+      throw new BadRequestException('entryXdr has no address credentials to authorize against');
+    }
+
     const signatureScVal = buildWebAuthnSignatureScVal(assertion);
     const signedEntry = await authorizeEntry(
       unsignedEntry,
@@ -145,8 +152,7 @@ export class AuthRelayService {
       this.networkPassphrase,
     );
 
-    const args = coerceWireArgs(marketSpec, functionName, wireArgs);
-    const scArgs = marketSpec.funcArgsToScVals(functionName, args);
+    const scArgs = buildSponsoredCallArgs(marketSpec, functionName, walletAddress, wireArgs);
     const op = new Contract(contractId).call(functionName, ...scArgs);
     op.body().invokeHostFunctionOp().auth([signedEntry]);
 
