@@ -10,7 +10,7 @@ import { AdminGuard } from './admin.guard';
  */
 describe('MarketController — admin routes stay guarded', () => {
   const adminRoutes = ['create', 'watch', 'settle', 'cancel'] as const;
-  const publicRoutes = ['list', 'get', 'state', 'position', 'price', 'fundFaucet'] as const;
+  const publicRoutes = ['list', 'get', 'state', 'position', 'price', 'fee', 'fundFaucet'] as const;
 
   it.each(adminRoutes)('%s carries AdminGuard', (method) => {
     const guards = Reflect.getMetadata(GUARDS_METADATA, MarketController.prototype[method]) ?? [];

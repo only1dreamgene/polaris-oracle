@@ -14,7 +14,6 @@ export interface AppConfig {
   nativeXlmSac: string | undefined;
   smartWalletFactoryContract: string | undefined;
   smartWalletWasmHash: string | undefined;
-  protocolFeeBps: number;
   treasuryAddress: string | undefined;
   xlmUsdFeedId: number;
   marketsDbFile: string;
@@ -44,7 +43,6 @@ export default (): AppConfig => ({
   nativeXlmSac: process.env.NATIVE_XLM_SAC,
   smartWalletFactoryContract: process.env.SMART_WALLET_FACTORY_CONTRACT,
   smartWalletWasmHash: process.env.SMART_WALLET_WASM_HASH,
-  protocolFeeBps: Number(process.env.PROTOCOL_FEE_BPS ?? 100),
   treasuryAddress: process.env.TREASURY_ADDRESS,
   // Placeholder testnet feed id — production must use Pyth's real
   // registered Lazer feed id for XLM/USD (see contracts README).

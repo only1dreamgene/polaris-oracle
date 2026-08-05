@@ -21,10 +21,6 @@ import { CreateMarketDto } from './dto/create-market.dto';
 import { WatchMarketDto } from './dto/watch-market.dto';
 import { FaucetDto } from './dto/faucet.dto';
 
-function serializeBigInts<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value, (_key, v) => (typeof v === 'bigint' ? v.toString() : v)));
-}
-
 @Controller('markets')
 export class MarketController {
   constructor(
@@ -48,8 +44,10 @@ export class MarketController {
 
   @Get(':id/state')
   async state(@Param('id') id: string) {
-    const state = await this.stellar.getMarketState(id);
-    return serializeBigInts(state);
+    // getMarketState already returns a fully normalized (camelCase,
+    // stringified bigints, unwrapped status) object — see StellarService's
+    // normalizeMarket for why the raw contract.Spec decode needs that step.
+    return this.stellar.getMarketState(id);
   }
 
   @Get(':id/position')
@@ -62,6 +60,11 @@ export class MarketController {
   @Get(':id/price')
   async price(@Param('id') id: string) {
     return this.stellar.getPrice(id);
+  }
+
+  @Get(':id/fee')
+  async fee(@Param('id') id: string) {
+    return { feeBps: await this.stellar.getFee(id) };
   }
 
   @Post('faucet')
@@ -90,7 +93,8 @@ export class MarketController {
       gracePeriodSecs: BigInt(dto.gracePeriodSecs),
       lazerContract,
       feedId,
-      feeBps: dto.feeBps,
+      baseFeeBps: dto.baseFeeBps,
+      minFeeBps: dto.minFeeBps,
       treasury,
       initialLiquidityStroops: BigInt(dto.initialLiquidityStroops),
       collateralAsset: nativeXlmSac,

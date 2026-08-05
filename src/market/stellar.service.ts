@@ -15,7 +15,8 @@ export interface CreateMarketParams {
   gracePeriodSecs: bigint;
   lazerContract: string;
   feedId: number;
-  feeBps: number;
+  baseFeeBps: number;
+  minFeeBps: number;
   treasury: string;
   initialLiquidityStroops: bigint;
   collateralAsset: string;
@@ -90,7 +91,7 @@ export class StellarService {
   async getMarketState(contractId: string): Promise<OnChainMarket> {
     const client = this.marketClient(contractId);
     const tx = await (client as any).get_market();
-    return tx.result as OnChainMarket;
+    return normalizeMarket(tx.result as RawOnChainMarket);
   }
 
   async getPosition(contractId: string, address: string): Promise<[bigint, bigint]> {
@@ -104,6 +105,13 @@ export class StellarService {
     const tx = await (client as any).get_price();
     const [yesBps, noBps] = tx.result as [number, number];
     return { yesBps, noBps };
+  }
+
+  /** Current effective swap fee (bps) per the market's volume-scaled fee curve — see `get_fee` in the contract. */
+  async getFee(contractId: string): Promise<number> {
+    const client = this.marketClient(contractId);
+    const tx = await (client as any).get_fee();
+    return tx.result as number;
   }
 
   // ---------- oracle-authorized writes ----------
@@ -134,6 +142,21 @@ export class StellarService {
     const tx = await (client as any).deploy({ public_key: publicKey, wasm_hash: walletWasmHash });
     const sent = await tx.signAndSend();
     return sent.result as string;
+  }
+
+  /**
+   * The address `deployWallet` would produce for `publicKey`, computed by
+   * the factory contract's own `resolve` view — a free simulated read, no
+   * transaction, no fee — without deploying anything. This is what makes a
+   * passkey a portable identity: any caller can check whether a wallet
+   * already exists for a given public key before prompting a "create
+   * wallet" flow, using the exact on-chain address-derivation formula
+   * rather than a reimplementation of it.
+   */
+  async resolveWallet(factoryContractId: string, publicKey: Buffer): Promise<string> {
+    const client = this.factoryClient(factoryContractId);
+    const tx = await (client as any).resolve({ public_key: publicKey });
+    return tx.result as string;
   }
 
   // ---------- market deployment (Stellar CLI) ----------
@@ -210,8 +233,10 @@ export class StellarService {
       params.lazerContract,
       '--feed_id',
       params.feedId.toString(),
-      '--fee_bps',
-      params.feeBps.toString(),
+      '--base_fee_bps',
+      params.baseFeeBps.toString(),
+      '--min_fee_bps',
+      params.minFeeBps.toString(),
       '--treasury',
       params.treasury,
       '--initial_liquidity',
@@ -220,4 +245,51 @@ export class StellarService {
     const initTxHash = invoke.stdout.trim();
     return { contractId, initTxHash };
   }
+}
+
+/**
+ * The exact shape `contract.Spec` decodes the Rust `Market` struct into:
+ * verified against `spec.js`'s `structToNative`/`unionToNative` (exact
+ * Rust field names, no case conversion; the `MarketStatus` union as
+ * `{ tag: 'Open' }` rather than a bare string) rather than assumed —
+ * see `normalizeMarket` below for the translation to the REST-facing shape.
+ */
+interface RawOnChainMarket {
+  admin: string;
+  collateral: string;
+  strike_price: bigint;
+  expiry: bigint;
+  grace_period: bigint;
+  lazer_contract: string;
+  feed_id: number;
+  base_fee_bps: number;
+  min_fee_bps: number;
+  treasury: string;
+  status: { tag: 'Open' | 'ResolvedYes' | 'ResolvedNo' | 'Cancelled' };
+  final_price: bigint;
+  pool_yes: bigint;
+  pool_no: bigint;
+  total_supply: bigint;
+  initial_liquidity: bigint;
+}
+
+function normalizeMarket(raw: RawOnChainMarket): OnChainMarket {
+  return {
+    admin: raw.admin,
+    collateral: raw.collateral,
+    strikePrice: raw.strike_price.toString(),
+    expiry: raw.expiry.toString(),
+    gracePeriod: raw.grace_period.toString(),
+    lazerContract: raw.lazer_contract,
+    feedId: raw.feed_id,
+    baseFeeBps: raw.base_fee_bps,
+    minFeeBps: raw.min_fee_bps,
+    treasury: raw.treasury,
+    status: raw.status.tag,
+    finalPrice: raw.final_price.toString(),
+    poolYes: raw.pool_yes.toString(),
+    poolNo: raw.pool_no.toString(),
+    totalSupply: raw.total_supply.toString(),
+    initialLiquidity: raw.initial_liquidity.toString(),
+  };
 }

@@ -20,6 +20,18 @@ See `../polaris-contracts/README.md` for the on-chain half of this system.
 | `faucet.service.ts` | Rate-limited (3/hour/address) Friendbot funding. |
 | `contracts.ts` | Loads `wasm/*.wasm` and parses each contract's real spec via `contract.Spec.fromWasm` — argument/return encoding for custom types (the `Prediction` enum, the `Market`/`Signature` structs) comes from the compiled contract, not from guessing the wire format. |
 
+## A decoding bug worth knowing about
+
+`contract.Spec` (used to decode every contract read) preserves the Rust
+struct's exact field names (snake_case) and represents enums as
+`{ tag: 'Open' }` rather than a bare string — it does **not** camelCase
+anything. An early version of `getMarketState` cast the raw decode result
+straight to the REST-facing `OnChainMarket` type and would have silently
+served wrong field names and an unusable status shape to every client. Now
+fixed by an explicit `normalizeMarket` translation in `stellar.service.ts`,
+verified against `spec.js`'s actual decode logic rather than assumed —
+worth knowing if you add a new on-chain read and reach for the same cast.
+
 ## Why native XLM, no custom test token
 
 The market contract's collateral is generic (any Stellar Asset Contract).
@@ -31,6 +43,12 @@ part, and thematically it's "stake XLM, predict XLM."
 ## Passkey smart wallets
 
 `wallet.controller.ts` exposes:
+- `GET /wallets/resolve?publicKeyHex=` — the address a passkey would deploy
+  to, computed by the factory contract's own `resolve` view (a free
+  simulated read, on-chain formula, not a reimplementation of it) without
+  deploying anything. This is the portable-identity lookup: a caller can
+  check whether a wallet already exists for a given passkey before deciding
+  whether to prompt registration.
 - `POST /wallets/deploy` — gasless: this process pays to deploy+init a new
   `polaris-smart-wallet` for a given secp256r1 public key via the
   `polaris-smart-wallet-factory` contract.
@@ -39,6 +57,12 @@ part, and thematically it's "stake XLM, predict XLM."
   the full protocol and why it's necessarily two round-trips (a passkey
   signature means an actual Face ID/Touch ID prompt in the browser, not a
   synchronous in-process callback).
+
+Note: the embeddable market widget (`<iframe>`-able on any third-party
+site) lives in `polaris-frontend`'s `/embed/[id]`, **not** here — WebAuthn's
+relying-party id is tied to the document's origin, so the widget has to be
+served from the same origin as the flagship app for a passkey to be usable
+in both places. This backend only supplies the data/relay APIs both consume.
 
 **Status**: structurally complete and grounded in the SDK's documented
 `authorizeEntry`/custom-account pattern (see the contracts repo for the
@@ -52,7 +76,7 @@ against. Treat the relay as unverified until run against testnet.
 cp .env.example .env   # fill in ORACLE_SECRET_KEY, ADMIN_API_KEY at minimum
 npm install
 npm run start:dev      # http://localhost:3001
-npm test                # 32 unit tests
+npm test                # 33 unit tests
 ```
 
 `ORACLE_SECRET_KEY` is the only hard requirement to boot — everything else

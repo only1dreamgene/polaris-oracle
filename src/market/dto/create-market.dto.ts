@@ -15,10 +15,18 @@ export class CreateMarketDto {
   @Min(60)
   gracePeriodSecs!: number;
 
-  /** Protocol swap fee, basis points (<= 1000 = 10%). */
+  /**
+   * Swap fee curve, basis points (<= 1000 = 10% each). The contract charges
+   * `baseFeeBps` on a fresh market, decaying toward `minFeeBps` as pool
+   * volume grows — see the contracts repo's "Cost-driven fee curve" section.
+   */
   @IsInt()
   @Min(0)
-  feeBps!: number;
+  baseFeeBps!: number;
+
+  @IsInt()
+  @Min(0)
+  minFeeBps!: number;
 
   /** Collateral pulled from the oracle keypair to seed the AMM pool, in stroops. */
   @IsNumberString()
