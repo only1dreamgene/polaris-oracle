@@ -23,7 +23,7 @@ See `../polaris-contracts/README.md` for the on-chain half of this system.
 
 ## Bugs found by pressure-testing this system
 
-Three real bugs surfaced by deliberately trying to break this system after
+Five real bugs surfaced by deliberately trying to break this system after
 it was "done," not just written once and left. Recorded here because each
 one is the kind of thing that looks fine in a code read and only shows up
 under adversarial pressure or a real failure:
@@ -56,12 +56,62 @@ under adversarial pressure or a real failure:
    perfectly fine market as stuck. Fixed with `reconcileWithChain` in
    `market.service.ts`, which checks live on-chain state before recording
    a settle/cancel failure as real.
+4. **`contract.Client` doesn't auto-unwrap a `Result<T, Error>`-returning
+   contract fn.** `getMarketState`, `getPrice`, and `getFee` all call
+   contract methods declared as `Result<T, Error>` in Rust
+   (`get_market`, `get_price`, `get_fee`), and each one cast `tx.result`
+   straight to its expected shape. In reality `tx.result` is a
+   `contract.Ok`/`contract.Err` wrapper (`Ok { value: T }` on success) — the
+   SDK leaves the `Result` for the caller to unwrap. This wasn't caught by
+   any earlier test because every prior test either mocked the RPC layer
+   below `contract.Client` or never exercised a real deployed contract; it
+   only surfaced once `POST /markets/watch` was pointed at a real testnet
+   market and crashed with `Cannot read properties of undefined (reading
+   'toString')` inside `normalizeMarket`. Fixed by calling `.unwrap()` on
+   `tx.result` before use in all three methods — confirmed with a live
+   `get_market()` call against the deployed contract first, then locked in
+   by `stellar.service.result-unwrap.spec.ts`, which mocks `marketClient()`
+   to return real `contract.Ok`-wrapped shapes. `get_position`
+   (`(i128, i128)`) and the factory's `deploy`/`resolve` (`Address`) are
+   *not* affected — none of those three are declared `Result` in Rust.
+5. **`origin: true` + `credentials: true` on the same `enableCors()` call
+   would let any website on the internet ride a signed-in user's session
+   cookie.** The `origin: origins.length > 0 ? origins : true` fallback
+   predates email login and was harmless then — nothing was
+   cookie-authenticated, so reflecting any origin only exposed
+   non-credentialed reads. Adding email login (this changeset) added
+   `credentials: true` to that *same* call, needed so the browser sends the
+   new `polaris_session` httpOnly cookie cross-origin
+   (`polaris-frontend`'s `api.ts`), and a fully cookie-authenticated,
+   fund-moving endpoint (`POST /auth/email/trade`, which allows
+   `function: 'transfer'`). `origin: true` makes the `cors` package reflect
+   whatever `Origin` header the request sent; combined with
+   `credentials: true`, any deployment where an operator forgets to set
+   `CORS_ORIGINS` (not enforced anywhere — `fly.toml` doesn't set it, it's
+   only a `fly secrets` value) lets a page on *any* domain do
+   `fetch(..., { credentials: 'include' })` against `/auth/email/trade`,
+   have the browser attach the victim's session cookie, and read the JSON
+   response back — full cross-origin account takeover, no XSS required,
+   worse than plain CSRF because the response is readable too. The passkey
+   trade path doesn't have this exposure the same way: it requires an
+   out-of-band biometric prompt CSRF can't fake, so a valid cookie alone
+   was never sufficient there. For email/custodial wallets a valid cookie
+   *is* the entire authorization, which is exactly what made this exploit
+   the CORS gap completely. Admin routes are unaffected — `AdminGuard`
+   checks an `x-admin-key` header, not ambient cookie credentials. Fixed in
+   `main.ts` by failing closed (empty origin allowlist, matching
+   `AdminGuard`'s fail-closed behavior on a missing `ADMIN_API_KEY`) instead
+   of falling back to `true` whenever `CORS_ORIGINS` is unset, with a loud
+   boot-time warning explaining why the fallback can never be "allow
+   everything" once credentials are involved.
 
 Worth knowing if you add a new on-chain read: `contract.Spec` preserves the
 Rust struct's exact field names (snake_case) and represents enums as
 `{ tag: 'Open' }` rather than a bare string — it does **not** camelCase
 anything, so casting a raw decode result straight to a REST-facing type
-(the mistake bug 2 was) is an easy trap to fall back into.
+(the mistake bug 2 was) is an easy trap to fall back into. Separately, if
+the Rust fn signature is `Result<T, Error>`, `tx.result` is `Ok`/`Err`, not
+`T` — call `.unwrap()` (bug 4).
 
 ## Why native XLM, no custom test token
 

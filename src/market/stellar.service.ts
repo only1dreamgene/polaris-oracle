@@ -91,7 +91,7 @@ export class StellarService {
   async getMarketState(contractId: string): Promise<OnChainMarket> {
     const client = this.marketClient(contractId);
     const tx = await (client as any).get_market();
-    return normalizeMarket(tx.result as RawOnChainMarket);
+    return normalizeMarket(tx.result.unwrap() as RawOnChainMarket);
   }
 
   async getPosition(contractId: string, address: string): Promise<[bigint, bigint]> {
@@ -103,7 +103,7 @@ export class StellarService {
   async getPrice(contractId: string): Promise<{ yesBps: number; noBps: number }> {
     const client = this.marketClient(contractId);
     const tx = await (client as any).get_price();
-    const [yesBps, noBps] = tx.result as [number, number];
+    const [yesBps, noBps] = tx.result.unwrap() as [number, number];
     return { yesBps, noBps };
   }
 
@@ -111,7 +111,7 @@ export class StellarService {
   async getFee(contractId: string): Promise<number> {
     const client = this.marketClient(contractId);
     const tx = await (client as any).get_fee();
-    return tx.result as number;
+    return tx.result.unwrap() as number;
   }
 
   // ---------- oracle-authorized writes ----------
