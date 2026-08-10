@@ -6,6 +6,8 @@ import { MarketRepository } from './market.repository';
 import type { WatchedMarket } from './market.types';
 
 const SETTLE_TIMEOUT_MS = 30_000;
+const RECONCILE_READ_ATTEMPTS = 3;
+const RECONCILE_READ_RETRY_DELAY_MS = 750;
 
 /**
  * Owns the in-memory timer state that drives settlement automation. The
@@ -150,12 +152,33 @@ export class MarketService implements OnModuleInit {
    * already finalized on-chain and, if so, sync local status to match
    * instead. Returns true if it reconciled (caller should stop, not persist
    * a failure).
+   *
+   * The read itself gets a few retries: confirmed live against testnet that
+   * a single transient RPC hiccup on this read alone was enough to make a
+   * *correctly finalized* market get stuck reporting `pending` with a stale
+   * error forever — `tryCancel`/`trySettle` never auto-retry, so this read
+   * silently failing was the only thing standing between "already handled"
+   * and "permanently looks broken." A few retries costs at most ~1.5s on the
+   * rare path where the first read fails; it doesn't touch the fast path.
    */
   private async reconcileWithChain(m: WatchedMarket): Promise<boolean> {
     let state;
-    try {
-      state = await this.stellar.getMarketState(m.contractId);
-    } catch {
+    let lastReadError: unknown;
+    for (let attempt = 1; attempt <= RECONCILE_READ_ATTEMPTS; attempt++) {
+      try {
+        state = await this.stellar.getMarketState(m.contractId);
+        break;
+      } catch (err) {
+        lastReadError = err;
+        if (attempt < RECONCILE_READ_ATTEMPTS) {
+          await new Promise((resolve) => setTimeout(resolve, RECONCILE_READ_RETRY_DELAY_MS));
+        }
+      }
+    }
+    if (!state) {
+      this.logger.warn(
+        `reconcileWithChain: couldn't read ${m.contractId}'s on-chain state after ${RECONCILE_READ_ATTEMPTS} attempts (${(lastReadError as Error)?.message}) — can't tell if it's already finalized`,
+      );
       return false; // can't tell — fall through to the normal failure path
     }
     if (state.status === 'ResolvedYes' || state.status === 'ResolvedNo') {

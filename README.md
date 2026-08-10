@@ -23,7 +23,7 @@ See `../polaris-contracts/README.md` for the on-chain half of this system.
 
 ## Bugs found by pressure-testing this system
 
-Five real bugs surfaced by deliberately trying to break this system after
+Six real bugs surfaced by deliberately trying to break this system after
 it was "done," not just written once and left. Recorded here because each
 one is the kind of thing that looks fine in a code read and only shows up
 under adversarial pressure or a real failure:
@@ -104,6 +104,32 @@ under adversarial pressure or a real failure:
    of falling back to `true` whenever `CORS_ORIGINS` is unset, with a loud
    boot-time warning explaining why the fallback can never be "allow
    everything" once credentials are involved.
+6. **`reconcileWithChain`'s own on-chain read could itself fail transiently
+   — and did, live, on testnet.** Bug 3 added `reconcileWithChain` so a
+   `settle`/`cancel` call that fails locally *after* already succeeding
+   on-chain doesn't get recorded as a stranded `pending` forever. Caught
+   deploying a real short-lived testnet market, buying a real position,
+   settling it directly against the deployed `mock-lazer` contract
+   (bypassing `OracleService` — no `PYTH_LAZER_TOKEN` in this environment),
+   and watching `MarketService`'s own automatic cancel-fallback timer fire
+   ~70s later, fail (the market was already `ResolvedYes`, exactly as
+   expected), call `reconcileWithChain` — and have *that* read fail too,
+   more than ten seconds after the settle had already confirmed, nowhere
+   near a plausible propagation race. `reconcileWithChain`'s read had
+   exactly one attempt and swallowed its own failure with a bare
+   `catch { return false; }` — no log, no distinguishing "definitely not
+   finalized" from "couldn't check right now." Since `tryCancel`/`trySettle`
+   never auto-retry (by design — each is a one-shot timer fire), a single
+   transient RPC hiccup on that one read was enough to leave a *perfectly
+   finalized* market stuck reporting `pending` with a stale, misleading
+   error until an admin happened to hit `/markets/:id/cancel` or `/settle`
+   manually. Confirmed the diagnosis by doing exactly that — one manual
+   retry reconciled it instantly, proving the market was fine the whole
+   time and the read was the only thing that had failed. Fixed by giving
+   the reconcile read a few retries with a short delay
+   (`RECONCILE_READ_ATTEMPTS` / `RECONCILE_READ_RETRY_DELAY_MS` in
+   `market.service.ts`) and logging the real error when they're all
+   exhausted instead of swallowing it silently.
 
 Worth knowing if you add a new on-chain read: `contract.Spec` preserves the
 Rust struct's exact field names (snake_case) and represents enums as

@@ -105,13 +105,15 @@ describe('MarketService — settlement orchestration', () => {
 
       const m = sample({ gracePeriodSecs: 60 });
       svc.watch(m);
-      await flushMicrotasks();
+      // reconcileWithChain's read retries use a real setTimeout between
+      // attempts (see RECONCILE_READ_RETRY_DELAY_MS) — advance fake timers
+      // past those before asserting, not just microtasks.
+      await jest.advanceTimersByTimeAsync(2000);
 
       expect(svc.get(m.contractId)?.status).toBe('pending');
       expect(svc.get(m.contractId)?.lastError).toMatch(/rpc exploded/);
 
-      jest.advanceTimersByTime(60_000 + 1000);
-      await flushMicrotasks();
+      await jest.advanceTimersByTimeAsync(60_000 + 1000);
 
       expect(stellar.cancel).toHaveBeenCalled();
       expect(svc.get(m.contractId)?.status).toBe('cancelled');
@@ -160,6 +162,70 @@ describe('MarketService — settlement orchestration', () => {
 
     expect(svc.get(m.contractId)?.status).toBe('cancelled');
     expect(svc.get(m.contractId)?.lastError).toBeUndefined();
+  });
+
+  it('retries the reconcile read past a transient RPC hiccup instead of stranding status as "pending"', async () => {
+    // Regression for: confirmed live against testnet that a single failed
+    // getMarketState() read inside reconcileWithChain — even moments after
+    // the market had genuinely finalized on-chain — left it reporting
+    // 'pending' with a stale error forever, since tryCancel/trySettle never
+    // auto-retry. The read now gets a few attempts before giving up.
+    jest.useFakeTimers();
+    try {
+      const repo = makeRepo();
+      const stellar = {
+        settle: jest.fn(),
+        cancel: jest.fn().mockRejectedValue(new Error('AlreadyFinalized')),
+        getMarketState: jest
+          .fn()
+          .mockRejectedValueOnce(new Error('rpc hiccup'))
+          .mockResolvedValueOnce({ status: 'Cancelled' }),
+      };
+      const oracle = { isAvailable: true, waitForUpdate: jest.fn() };
+      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService);
+
+      const m = sample({ status: 'pending' });
+      repo.upsert(m);
+
+      const triggerPromise = svc.triggerCancel(m.contractId);
+      // The retry delay uses a real setTimeout — advance fake timers until
+      // the pending reconcile read (queued as a microtask) resolves.
+      await jest.advanceTimersByTimeAsync(1000);
+      await triggerPromise;
+
+      expect(stellar.getMarketState).toHaveBeenCalledTimes(2);
+      expect(svc.get(m.contractId)?.status).toBe('cancelled');
+      expect(svc.get(m.contractId)?.lastError).toBeUndefined();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('gives up after exhausting reconcile read retries and logs why, instead of throwing', async () => {
+    jest.useFakeTimers();
+    try {
+      const repo = makeRepo();
+      const stellar = {
+        settle: jest.fn(),
+        cancel: jest.fn().mockRejectedValue(new Error('AlreadyFinalized')),
+        getMarketState: jest.fn().mockRejectedValue(new Error('rpc down')),
+      };
+      const oracle = { isAvailable: true, waitForUpdate: jest.fn() };
+      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService);
+
+      const m = sample({ status: 'pending' });
+      repo.upsert(m);
+
+      const triggerPromise = svc.triggerCancel(m.contractId);
+      await jest.advanceTimersByTimeAsync(3000);
+      await triggerPromise;
+
+      expect(stellar.getMarketState).toHaveBeenCalledTimes(3);
+      expect(svc.get(m.contractId)?.status).toBe('pending');
+      expect(svc.get(m.contractId)?.lastError).toMatch(/AlreadyFinalized/);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('does not re-settle or re-cancel an already-finalized market', async () => {
