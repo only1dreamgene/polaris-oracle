@@ -133,12 +133,11 @@ export class EmailAuthService {
 
     const { privateKey, publicKey } = generateP256Keypair();
     const factoryId = this.config.get<string>('smartWalletFactoryContract');
-    const walletWasmHash = this.config.get<string>('smartWalletWasmHash');
-    if (!factoryId || !walletWasmHash) {
+    if (!factoryId) {
       throw new EmailAuthError('Email wallets are not configured on this server yet.');
     }
 
-    const address = await this.stellar.deployWallet(factoryId, publicKey, Buffer.from(walletWasmHash, 'hex'));
+    const address = await this.stellar.deployWallet(factoryId, publicKey);
     const encrypted = encryptAtRest(privateKey, this.config.get<string>('emailWalletEncKeyHex')!);
     this.repo.saveWallet(email, address, publicKey.toString('hex'), encrypted);
     this.logger.log(`deployed custodial wallet ${address} for a new email login`);

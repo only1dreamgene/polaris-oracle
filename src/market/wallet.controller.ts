@@ -41,17 +41,10 @@ export class WalletController {
   @Post('deploy')
   async deploy(@Body() dto: DeployWalletDto) {
     const factoryId = this.config.get<string>('smartWalletFactoryContract');
-    const walletWasmHash = this.config.get<string>('smartWalletWasmHash');
-    if (!factoryId || !walletWasmHash) {
-      throw new BadRequestException(
-        'SMART_WALLET_FACTORY_CONTRACT and SMART_WALLET_WASM_HASH must be configured to deploy wallets',
-      );
+    if (!factoryId) {
+      throw new BadRequestException('SMART_WALLET_FACTORY_CONTRACT must be configured to deploy wallets');
     }
-    const address = await this.stellar.deployWallet(
-      factoryId,
-      Buffer.from(dto.publicKeyHex, 'hex'),
-      Buffer.from(walletWasmHash, 'hex'),
-    );
+    const address = await this.stellar.deployWallet(factoryId, Buffer.from(dto.publicKeyHex, 'hex'));
     return { address };
   }
 

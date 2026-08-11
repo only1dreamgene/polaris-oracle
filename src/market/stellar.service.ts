@@ -176,12 +176,34 @@ export class StellarService {
    * fee — so a brand-new user can get a working Soroban address before they
    * hold a single stroop. Returns the wallet's contract address, decoded
    * straight from the factory call's result.
+   *
+   * No wasm hash passed here — `deploy` takes only `public_key` now. It
+   * used to accept a caller-chosen wasm hash too, which was a real,
+   * confirmed-exploitable address-hijack vector (see
+   * `polaris-contracts/README.md`'s "Factory wasm pinning" section): the
+   * factory now always deploys its own pinned wallet code, set once via
+   * `initializeFactory` below.
    */
-  async deployWallet(factoryContractId: string, publicKey: Buffer, walletWasmHash: Buffer): Promise<string> {
+  async deployWallet(factoryContractId: string, publicKey: Buffer): Promise<string> {
     const client = this.factoryClient(factoryContractId);
-    const tx = await (client as any).deploy({ public_key: publicKey, wasm_hash: walletWasmHash });
+    const tx = await (client as any).deploy({ public_key: publicKey });
     const sent = await tx.signAndSend();
-    return sent.result as string;
+    return (sent.result as { unwrap: () => string }).unwrap();
+  }
+
+  /**
+   * One-time factory setup pinning which wallet wasm `deploy` will ever
+   * run — must be called once after deploying a fresh
+   * `smart-wallet-factory` instance, before `deployWallet` will do
+   * anything. `admin` here is only the authority to set this once; it has
+   * no ongoing role over deployed wallets.
+   */
+  async initializeFactory(factoryContractId: string, walletWasmHash: Buffer): Promise<string> {
+    const client = this.factoryClient(factoryContractId);
+    const tx = await (client as any).initialize({ admin: this.oraclePublicKey, wasm_hash: walletWasmHash });
+    const sent = await tx.signAndSend();
+    (sent.result as { unwrap: () => void }).unwrap();
+    return sent.sendTransactionResponse?.hash ?? sent.getTransactionResponse?.txHash ?? '';
   }
 
   /**
