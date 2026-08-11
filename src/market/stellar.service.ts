@@ -9,6 +9,46 @@ import type { OnChainMarket } from './market.types';
 
 const execFileAsync = promisify(execFile);
 
+const CLI_RETRY_ATTEMPTS = 3;
+const CLI_RETRY_DELAY_MS = 2000;
+/** Gives the deployed contract a moment to propagate before `initialize` looks for it — see `deployMarket`. */
+const DEPLOY_TO_INIT_DELAY_MS = 1500;
+
+/**
+ * `stellar` CLI failures seen live on testnet, from back-to-back calls
+ * sharing one source account, turned out to come in more shapes than any
+ * fixed allowlist of error strings could keep up with: `Contract not found`
+ * and `HostError: Error(Storage, MissingValue)` are the *same* RPC-hasn't-
+ * caught-up-to-the-deploy-yet race, worded differently; `TxBadSeq` is two
+ * CLI processes racing on the account's sequence number; `client error
+ * (SendRequest)` and a plain `transaction submission timeout` are the RPC
+ * connection itself hiccuping. All of these resolved on retry.
+ *
+ * The one thing that must NOT be retried is a genuine rejection from the
+ * *contract's own logic* (`HostError: Error(Contract, #N)` — bad strike
+ * price, insufficient balance, an already-finalized market, ...): that
+ * fails identically every time, so retrying it only wastes the attempt
+ * budget before failing anyway with extra delay. Given how varied the
+ * transient shapes have proven to be, retrying everything except a
+ * confirmed contract-level rejection is the more defensible default than
+ * chasing each new transient wording as it turns up.
+ */
+const PERMANENT_CONTRACT_ERROR = /Error\(Contract,/;
+
+export function isTransientStellarCliError(message: string): boolean {
+  return !PERMANENT_CONTRACT_ERROR.test(message);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** The CLI's own `❌ error: ...` line if there is one — its stderr is otherwise multiple `ℹ️` progress lines followed by that summary, not necessarily last (a trailing diagnostic event dump can follow it). Falls back to the first line for a message with no such marker. */
+function summaryLine(message: string): string {
+  const lines = message.trim().split('\n');
+  return lines.find((line) => line.includes('❌')) ?? lines[0];
+}
+
 export interface CreateMarketParams {
   strikePriceCents: bigint;
   expiry: bigint;
@@ -187,7 +227,7 @@ export class StellarService {
   // real value at stake would reasonably want these separated again).
   async deployMarket(params: CreateMarketParams): Promise<{ contractId: string; initTxHash: string }> {
     const network = this.config.get<string>('stellarNetwork')!;
-    const deploy = await execFileAsync('stellar', [
+    const deploy = await this.execStellarCli([
       'contract',
       'deploy',
       '--wasm',
@@ -204,7 +244,13 @@ export class StellarService {
     const contractId = deploy.stdout.trim().split('\n').pop()!.trim();
     this.logger.log(`deployed market contract ${contractId}`);
 
-    const invoke = await execFileAsync('stellar', [
+    // The freshly deployed contract isn't always visible to the RPC node
+    // `initialize` immediately queries next — a bare wait here cuts down how
+    // often the retry below is actually needed, rather than relying on it
+    // to paper over an avoidable race every time.
+    await sleep(DEPLOY_TO_INIT_DELAY_MS);
+
+    const invoke = await this.execStellarCli([
       'contract',
       'invoke',
       '--id',
@@ -244,6 +290,28 @@ export class StellarService {
     ]);
     const initTxHash = invoke.stdout.trim();
     return { contractId, initTxHash };
+  }
+
+  /** Runs a `stellar` CLI call, retrying past the transient failures in `TRANSIENT_CLI_ERROR`. Anything else fails immediately — retrying a genuine error (bad params, insufficient balance) would just waste time before failing anyway. */
+  private async execStellarCli(
+    args: string[],
+    attempts = CLI_RETRY_ATTEMPTS,
+  ): Promise<{ stdout: string; stderr: string }> {
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        return await execFileAsync('stellar', args);
+      } catch (err) {
+        lastErr = err;
+        const message = (err as { stderr?: string; message: string }).stderr ?? (err as Error).message;
+        if (attempt === attempts || !isTransientStellarCliError(message)) throw err;
+        this.logger.warn(
+          `stellar CLI call failed transiently (attempt ${attempt}/${attempts}), retrying: ${summaryLine(message)}`,
+        );
+        await sleep(CLI_RETRY_DELAY_MS);
+      }
+    }
+    throw lastErr;
   }
 }
 

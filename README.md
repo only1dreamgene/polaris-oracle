@@ -23,7 +23,7 @@ See `../polaris-contracts/README.md` for the on-chain half of this system.
 
 ## Bugs found by pressure-testing this system
 
-Six real bugs surfaced by deliberately trying to break this system after
+Seven real bugs surfaced by deliberately trying to break this system after
 it was "done," not just written once and left. Recorded here because each
 one is the kind of thing that looks fine in a code read and only shows up
 under adversarial pressure or a real failure:
@@ -130,6 +130,33 @@ under adversarial pressure or a real failure:
    (`RECONCILE_READ_ATTEMPTS` / `RECONCILE_READ_RETRY_DELAY_MS` in
    `market.service.ts`) and logging the real error when they're all
    exhausted instead of swallowing it silently.
+7. **`deployMarket()`'s two back-to-back `stellar` CLI calls (`deploy` then
+   `initialize`, same source account for both) had zero resilience to
+   testnet RPC hiccups** — any transient failure surfaced as a bare 500 to
+   the admin caller, no retry, nothing. Went looking for this after bug 6
+   turned up the same root cause (an unretried single RPC call) in a
+   different spot; confirmed it live by firing real `/markets/create`
+   calls and hitting it immediately. The failure text turned out to come in
+   more shapes than expected — `Contract not found` and `HostError:
+   Error(Storage, MissingValue)` are the *same* "RPC hasn't caught up to
+   the deploy yet" race worded differently; `TxBadSeq` is two CLI processes
+   racing on the account's sequence number; `client error (SendRequest)`
+   and a plain `transaction submission timeout` are the RPC connection
+   itself hiccuping. An early fix allowlisted three exact error strings and
+   missed the other two on the very next live run — replaced with the
+   inverse: retry everything *except* a confirmed contract-level rejection
+   (`HostError: Error(Contract, #N)` — bad strike price, insufficient
+   balance, etc., which fails identically every time, so retrying it is
+   pure wasted delay). See `isTransientStellarCliError` /
+   `execStellarCli` in `stellar.service.ts`, plus a fixed short wait after
+   `deploy` before `initialize`'s first attempt, to cut down on how often
+   the retry is even needed. **Honest limit, not swept under the rug:**
+   this raises the odds a transient hiccup self-resolves, it does not make
+   admin market creation immune to testnet being *severely* degraded — one
+   live run during this fix hit a gap of several minutes on a single CLI
+   call before it failed, which no small, bounded client-side retry policy
+   can paper over without making a normal call hang just as long. That
+   remains a "try again" case for the admin, same as before.
 
 Worth knowing if you add a new on-chain read: `contract.Spec` preserves the
 Rust struct's exact field names (snake_case) and represents enums as
