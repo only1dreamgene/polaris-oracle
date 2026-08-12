@@ -4,7 +4,7 @@ import { Keypair, rpc } from '@stellar/stellar-sdk';
 import { contract as StellarContract } from '@stellar/stellar-sdk';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { marketSpec, factorySpec } from './contracts';
+import { marketSpec, factorySpec, vaultSpec } from './contracts';
 import type { OnChainMarket } from './market.types';
 
 const execFileAsync = promisify(execFile);
@@ -126,6 +126,18 @@ export class StellarService {
     });
   }
 
+  private vaultClient(contractId: string) {
+    return new StellarContract.Client(vaultSpec, {
+      contractId,
+      networkPassphrase: this.networkPassphrase,
+      rpcUrl: this.rpcUrl,
+      allowHttp: this.rpcUrl.startsWith('http://'),
+      publicKey: this.keypair.publicKey(),
+      signTransaction: this.keypair as unknown as StellarContract.ClientOptions['signTransaction'],
+      server: this.server,
+    });
+  }
+
   // ---------- reads (simulated, no fee, no signature) ----------
 
   async getMarketState(contractId: string): Promise<OnChainMarket> {
@@ -221,6 +233,34 @@ export class StellarService {
     return tx.result as string;
   }
 
+  // ---------- capital-efficiency vault ----------
+  //
+  // See `polaris-contracts/README.md`'s "The capital-efficiency vault" for
+  // the full design. This backend only ever withdraws from it (to seed a
+  // new market's initial_liquidity) and reads its balance — deposits and
+  // admin setup (`initialize`) are operator actions taken directly via the
+  // Stellar CLI, not something the app itself does on anyone's behalf.
+
+  /** Available capital, in stroops — checked before `MarketFactoryService` withdraws to seed a new market, so an underfunded vault fails loudly instead of a partial/confusing on-chain error. */
+  async vaultBalance(vaultContractId: string): Promise<bigint> {
+    const client = this.vaultClient(vaultContractId);
+    const tx = await (client as any).get_balance();
+    return (tx.result as { unwrap: () => bigint }).unwrap();
+  }
+
+  /** Moves `amount` stroops from the vault to this process's own account, to fund a new market's `initial_liquidity` — the same account `deployMarket` already transfers that liquidity from. */
+  async vaultWithdraw(vaultContractId: string, amount: bigint): Promise<string> {
+    const client = this.vaultClient(vaultContractId);
+    const tx = await (client as any).withdraw({
+      admin: this.oraclePublicKey,
+      to: this.oraclePublicKey,
+      amount,
+    });
+    const sent = await tx.signAndSend();
+    (sent.result as { unwrap: () => void }).unwrap();
+    return sent.sendTransactionResponse?.hash ?? sent.getTransactionResponse?.txHash ?? '';
+  }
+
   // ---------- market deployment (Stellar CLI) ----------
   //
   // Every other write in this service goes through `contract.Client`,
@@ -272,7 +312,7 @@ export class StellarService {
     // to paper over an avoidable race every time.
     await sleep(DEPLOY_TO_INIT_DELAY_MS);
 
-    const invoke = await this.execStellarCli([
+    const initArgs = [
       'contract',
       'invoke',
       '--id',
@@ -309,9 +349,33 @@ export class StellarService {
       params.treasury,
       '--initial_liquidity',
       params.initialLiquidityStroops.toString(),
-    ]);
-    const initTxHash = invoke.stdout.trim();
-    return { contractId, initTxHash };
+    ];
+
+    try {
+      const invoke = await this.execStellarCli(initArgs);
+      return { contractId, initTxHash: invoke.stdout.trim() };
+    } catch (err) {
+      // Confirmed live: the CLI's own submission can succeed on-chain while
+      // still reporting a client-side failure (its result-polling hit a
+      // hiccup and, per the doc comment on PERMANENT_CONTRACT_ERROR, a
+      // second internal attempt then simulates against the now-initialized
+      // contract and reports the *simulation's* rejection instead) — the
+      // exact same "crash between on-chain success and this backend
+      // recording it" shape as MarketService.reconcileWithChain, just for
+      // deploy instead of settle/cancel. Without this check, a genuinely
+      // successful deploy would be reported as a failure and — for
+      // MarketFactoryService specifically — the vault capital that already
+      // funded this real, open market would never get an entry in
+      // MarketRepository, so it would never get settlement timers armed.
+      const message = (err as { stderr?: string; message: string }).stderr ?? (err as Error).message;
+      if (!/Error\(Contract, #2\)/.test(message)) throw err; // #2 = AlreadyInitialized, see contracts/market's Error enum
+      const state = await this.getMarketState(contractId);
+      if (state.status !== 'Open') throw err; // genuinely uninitialized/broken — the AlreadyInitialized report was accurate, not a false negative
+      this.logger.warn(
+        `initialize on ${contractId} reported AlreadyInitialized but the contract is Open on-chain — treating as already succeeded, not a failure (no initTxHash available for this reconciled path)`,
+      );
+      return { contractId, initTxHash: '' };
+    }
   }
 
   /** Runs a `stellar` CLI call, retrying past the transient failures in `TRANSIENT_CLI_ERROR`. Anything else fails immediately — retrying a genuine error (bad params, insufficient balance) would just waste time before failing anyway. */

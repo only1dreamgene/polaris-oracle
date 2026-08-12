@@ -5,6 +5,7 @@ import { PriceController } from './price.controller';
 import { WalletController } from './wallet.controller';
 import { EmailAuthController } from './email-auth.controller';
 import { MarketService } from './market.service';
+import { MarketFactoryService } from './market-factory.service';
 import { StellarService } from './stellar.service';
 import { OracleService } from './oracle.service';
 import { AuthRelayService } from './auth-relay.service';
@@ -19,6 +20,7 @@ import { EMAIL_SENDER, ConsoleEmailSender, ResendEmailSender } from './email-sen
   controllers: [MarketController, PriceController, WalletController, EmailAuthController],
   providers: [
     MarketService,
+    MarketFactoryService,
     StellarService,
     OracleService,
     AuthRelayService,

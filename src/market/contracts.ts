@@ -19,7 +19,9 @@ function loadWasm(name: string): Buffer {
 export const MARKET_WASM = loadWasm('polaris_market.wasm');
 export const SMART_WALLET_FACTORY_WASM = loadWasm('polaris_smart_wallet_factory.wasm');
 export const SMART_WALLET_WASM = loadWasm('polaris_smart_wallet.wasm');
+export const VAULT_WASM = loadWasm('polaris_vault.wasm');
 
 export const marketSpec = contract.Spec.fromWasm(MARKET_WASM);
 export const factorySpec = contract.Spec.fromWasm(SMART_WALLET_FACTORY_WASM);
 export const smartWalletSpec = contract.Spec.fromWasm(SMART_WALLET_WASM);
+export const vaultSpec = contract.Spec.fromWasm(VAULT_WASM);

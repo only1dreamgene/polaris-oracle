@@ -33,6 +33,32 @@ export interface AppConfig {
   /** Only used to fill in a WebAuthn-shaped `client_data_json`/`rpIdHash` for custodial signatures — never validated on-chain (see `email-wallet-signer.ts`), so these don't need to match the frontend exactly. */
   emailWalletRpId: string;
   emailWalletOrigin: string;
+  vaultContract: string | undefined;
+  /**
+   * Feeds `MarketFactoryService` creates markets for. Not auto-discovered
+   * from Pyth's catalog — `@pythnetwork/pyth-lazer-sdk` (as installed) is a
+   * subscription client for feed ids/symbols you already know, it has no
+   * feed-catalog/discovery method, and no separate catalog API ships with
+   * it. So this is "no human clicks a button," not "automatically finds
+   * every tradeable asset" — a maintained list, not a live discovery feed.
+   * See `polaris-contracts/README.md`'s vault section for how this fits
+   * into market creation.
+   *
+   * `feedId` is the small-integer Pyth Lazer id (`XLM_USD_FEED_ID`'s scheme
+   * — what `settle()` subscribes to and what gets stored per market).
+   * `hermesFeedId` is the *separate* 32-byte-hex id Pyth's Hermes HTTP API
+   * uses (same distinction `PriceController` already documents) — the
+   * factory reads it once per catalog entry to pick a fresh strike price at
+   * creation time, since nothing in this backend decodes Lazer's signed
+   * `leEcdsa` payload into a plain number outside the contract itself.
+   */
+  feedCatalog: { feedId: number; hermesFeedId: string; symbol: string }[];
+  marketFactoryIntervalSecs: number;
+  marketFactoryExpirySecs: number;
+  marketFactoryGracePeriodSecs: number;
+  marketFactoryBaseFeeBps: number;
+  marketFactoryMinFeeBps: number;
+  marketFactoryInitialLiquidityStroops: string;
 }
 
 import { randomBytes } from 'node:crypto';
@@ -53,6 +79,42 @@ function devFallbackSecret(envVar: string, byteLength: number): string {
       `Custodial email wallets will be unrecoverable after a restart until this is set. Do not run production like this.`,
   );
   return randomBytes(byteLength).toString('hex');
+}
+
+// XLM/USD's real Hermes registry id — confirmed live against
+// `hermes.pyth.network`'s own `/v2/price_feeds?query=XLM` lookup and a real
+// `/v2/updates/price/latest` read (not copied from memory/docs and hoped
+// correct), unlike XLM_USD_FEED_ID's Lazer id above, which really is an
+// unverified testnet placeholder since Lazer has no equivalent public
+// lookup. Still: this only decides the *strike price* of an auto-created
+// market, not settlement — a wrong id here fails the Hermes lookup loudly
+// per-feed (see MarketFactoryService.run), it doesn't misprice anything
+// silently.
+const DEFAULT_FEED_CATALOG: { feedId: number; hermesFeedId: string; symbol: string }[] = [
+  { feedId: 100, hermesFeedId: '0xb7a8eba68a997cd0210c2e1e4ee811ad2d174b3611c22d9ebf16f4cb7e9ba850', symbol: 'XLM/USD' },
+];
+
+/** Parses `FEED_CATALOG` (a JSON array of `{feedId, hermesFeedId, symbol}`) — falls back to the single feed this build has always used rather than throwing, since a malformed env var shouldn't stop the whole process from booting. */
+function parseFeedCatalog(raw: string | undefined): { feedId: number; hermesFeedId: string; symbol: string }[] {
+  if (!raw) return DEFAULT_FEED_CATALOG;
+  try {
+    const parsed = JSON.parse(raw);
+    if (
+      Array.isArray(parsed) &&
+      parsed.every(
+        (f) => typeof f?.feedId === 'number' && typeof f?.hermesFeedId === 'string' && typeof f?.symbol === 'string',
+      )
+    ) {
+      return parsed;
+    }
+  } catch {
+    // fall through to the warning + default below
+  }
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[config] FEED_CATALOG is set but not a valid JSON array of {feedId, hermesFeedId, symbol} — using the default.`,
+  );
+  return DEFAULT_FEED_CATALOG;
 }
 
 export default (): AppConfig => ({
@@ -97,4 +159,12 @@ export default (): AppConfig => ({
   emailCodeResendCooldownSecs: Number(process.env.EMAIL_CODE_RESEND_COOLDOWN_SECS ?? 60),
   emailWalletRpId: process.env.EMAIL_WALLET_RP_ID ?? 'localhost',
   emailWalletOrigin: process.env.EMAIL_WALLET_ORIGIN ?? 'http://localhost:3000',
+  vaultContract: process.env.VAULT_CONTRACT,
+  feedCatalog: parseFeedCatalog(process.env.FEED_CATALOG),
+  marketFactoryIntervalSecs: Number(process.env.MARKET_FACTORY_INTERVAL_SECS ?? 6 * 60 * 60), // 6 hours
+  marketFactoryExpirySecs: Number(process.env.MARKET_FACTORY_EXPIRY_SECS ?? 24 * 60 * 60), // 24 hours
+  marketFactoryGracePeriodSecs: Number(process.env.MARKET_FACTORY_GRACE_PERIOD_SECS ?? 3600),
+  marketFactoryBaseFeeBps: Number(process.env.MARKET_FACTORY_BASE_FEE_BPS ?? 100),
+  marketFactoryMinFeeBps: Number(process.env.MARKET_FACTORY_MIN_FEE_BPS ?? 20),
+  marketFactoryInitialLiquidityStroops: process.env.MARKET_FACTORY_INITIAL_LIQUIDITY_STROOPS ?? '1000000000', // 100 XLM
 });

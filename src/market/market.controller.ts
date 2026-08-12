@@ -14,6 +14,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { MarketService } from './market.service';
+import { MarketFactoryService } from './market-factory.service';
 import { StellarService } from './stellar.service';
 import { FaucetService } from './faucet.service';
 import { AdminGuard } from './admin.guard';
@@ -25,6 +26,7 @@ import { FaucetDto } from './dto/faucet.dto';
 export class MarketController {
   constructor(
     private readonly markets: MarketService,
+    private readonly factory: MarketFactoryService,
     private readonly stellar: StellarService,
     private readonly faucet: FaucetService,
     private readonly config: ConfigService,
@@ -109,6 +111,13 @@ export class MarketController {
     });
 
     return { ...watched, initTxHash };
+  }
+
+  @Post('factory/run')
+  @UseGuards(AdminGuard)
+  @HttpCode(200)
+  async runFactory() {
+    return this.factory.run();
   }
 
   @Post('watch')

@@ -15,6 +15,7 @@ See `../polaris-contracts/README.md` for the on-chain half of this system.
 | `auth-relay.service.ts` | Sponsors passkey-authorized calls: this process pays the fee, a WebAuthn passkey signs the Soroban authorization entry, in two HTTP round-trips (`prepare` / `submit`). |
 | `oracle.service.ts` | Pyth Lazer WebSocket client (`@pythnetwork/pyth-lazer-sdk`). Exposes `isAvailable` and `waitForUpdate`. |
 | `market.service.ts` | Settlement orchestration: arms a timer per watched market, falls back to permissionless `cancel` on any failure or oracle outage, re-arms on process restart. |
+| `market-factory.service.ts` | "No human clicks a button" market creation: sweeps a configured feed catalog on an interval, funds each new market's seed liquidity from the capital-efficiency vault instead of a manual admin transfer. See "Market factory automation" below. |
 | `market.repository.ts` | WAL-journaled SQLite persistence via `better-sqlite3`. |
 | `admin.guard.ts` | `x-admin-key` check, constant-time compare, fails closed if unset. |
 | `faucet.service.ts` | Rate-limited (3/hour/address) Friendbot funding. |
@@ -23,7 +24,7 @@ See `../polaris-contracts/README.md` for the on-chain half of this system.
 
 ## Bugs found by pressure-testing this system
 
-Seven real bugs surfaced by deliberately trying to break this system after
+Eight real bugs surfaced by deliberately trying to break this system after
 it was "done," not just written once and left. Recorded here because each
 one is the kind of thing that looks fine in a code read and only shows up
 under adversarial pressure or a real failure:
@@ -157,6 +158,34 @@ under adversarial pressure or a real failure:
    call before it failed, which no small, bounded client-side retry policy
    can paper over without making a normal call hang just as long. That
    remains a "try again" case for the admin, same as before.
+8. **The bug-7 retry logic could itself paper over a success and report it
+   as a failure.** Confirmed live the first time `MarketFactoryService` ever
+   ran against real testnet: `deployMarket`'s `initialize` call reported
+   `HostError: Error(Contract, #2)` (`AlreadyInitialized`) on a contract that
+   had just been freshly deployed seconds earlier — impossible on a genuine
+   first `initialize`, unless the CLI's own submission had actually already
+   succeeded on-chain and only its *result reporting* failed (a network
+   hiccup between submit and confirmation, most likely), so the error
+   surfacing was really a second, redundant simulation running against
+   already-initialized storage. This is bug 3's exact shape
+   (`reconcileWithChain`) in a spot that never got the same treatment:
+   `deployMarket` had gained retry *resilience* (bug 7) but not
+   *reconciliation* — a permanent-looking error was still trusted at face
+   value instead of being checked against live chain state first. Confirmed
+   by reading the "failed" contract's `get_market()` directly: fully
+   initialized, `status: "Open"`, every field matching the request
+   (`treasury` = the vault, `strike_price` = the live Hermes-derived price).
+   Worse than an ordinary observability gap here specifically: `deployMarket`
+   throwing meant `MarketFactoryService` never called `MarketService.watch()`,
+   so a real, vault-funded, on-chain-open market would have sat completely
+   untracked — no settlement timer, no cancel fallback, silently orphaned
+   despite holding real withdrawn capital. Fixed by catching exactly
+   `Error(Contract, #2)` around the `initialize` call, reading
+   `getMarketState` before giving up, and treating a confirmed `Open` status
+   as success (no `initTxHash` available for that reconciled path, since the
+   original submission's hash was never seen). The orphaned market this
+   produced live (`CDEBN4JLIKNRZOL4WQQZ6ZAAP2P5PQPJCK6HIITKRN2V46T3IR6JH4W7`)
+   was registered manually via `POST /markets/watch` rather than discarded.
 
 Worth knowing if you add a new on-chain read: `contract.Spec` preserves the
 Rust struct's exact field names (snake_case) and represents enums as
@@ -204,13 +233,66 @@ low-S signature normalization gotcha this uncovered), but this build
 environment has no live Soroban RPC access to exercise it end-to-end
 against. Treat the relay as unverified until run against testnet.
 
+## Market factory automation
+
+`MarketFactoryService` closes the last manual step in market creation: until
+now, `POST /markets/create` needed a human to pick a strike price, fund
+`initial_liquidity` from their own balance, and click a button. The factory
+sweeps a configured feed catalog (`FEED_CATALOG` — see `.env.example`) on an
+interval (`MARKET_FACTORY_INTERVAL_SECS`, default 6h) and, for each feed with
+no open/pending tracked market:
+
+1. Reads the current price from Pyth's **Hermes** HTTP API (`pythHermesUrl`)
+   — not the Lazer feed used for settlement. These are two genuinely
+   different id schemes for the same underlying asset (see
+   `PriceController`'s own doc comment); `configuration.ts`'s
+   `FeedCatalogEntry` carries both (`feedId` for settlement, `hermesFeedId`
+   for pricing). `hermesPriceToCents` converts Hermes' `{price, expo}` pair
+   into whole cents, rounding to the nearest cent rather than truncating (a
+   floor bias would skew every fresh coin-flip market toward one side).
+2. Withdraws `MARKET_FACTORY_INITIAL_LIQUIDITY_STROOPS` from the
+   capital-efficiency vault (`StellarService.vaultWithdraw` — see
+   `../polaris-contracts/README.md`'s vault section) *before* attempting to
+   deploy, so a withdrawal failure (vault underfunded, misconfigured) fails
+   that feed loudly and skips it — never a market deployed without the
+   capital to back it.
+3. Calls the existing `StellarService.deployMarket()` unchanged, with
+   `treasury` set to the **vault's** contract address rather than this
+   process's own — so the vault can later collect its own payout via
+   `redeem_from_market` once the market resolves.
+4. Registers the new market with `MarketService.watch()`, arming the same
+   settlement/cancel timers a manually-created market gets.
+
+Each catalog entry is independent — one feed's failure (a bad Hermes lookup,
+an underfunded vault) is logged and skipped, not a reason to abort the rest
+of the sweep. `POST /markets/factory/run` (behind `AdminGuard`) triggers a
+sweep on demand, for ops visibility rather than only a silent background
+timer.
+
+**Verified live on testnet**, not just unit-tested: deposited 500 XLM into
+the deployed vault (`CDDZCX5PT7FURKHTHNKXGNJJNURS4M7BLLNS6BHRV4RJM6CJT25SNCF5`,
+balance confirmed `5,020,000,000` stroops via `get_balance`), fetched
+XLM/USD's real Hermes id live (`https://hermes.pyth.network/v2/price_feeds?query=XLM`,
+not copied from memory — see the comment above `DEFAULT_FEED_CATALOG` in
+`configuration.ts`), then triggered `POST /markets/factory/run` against the
+real backend. It withdrew 100 XLM from the vault, deployed and initialized a
+real market (`CDEBN4JLIKNRZOL4WQQZ6ZAAP2P5PQPJCK6HIITKRN2V46T3IR6JH4W7`) with
+`treasury` = the vault and `strike_price` = the live Hermes price (16 cents,
+i.e. $0.16 XLM/USD at the time) — confirmed directly via `get_market()` — and
+the vault's on-chain balance dropped by exactly 100 XLM
+(`5,020,000,000` → `4,020,000,000`), matching the withdrawal precisely. That
+same live run also turned up bug 8 below; after the fix, re-running
+`POST /markets/factory/run` correctly reported `"skipped": ["XLM/USD"]` since
+a tracked open market for that feed now existed — the idempotency check
+works, confirmed live, not just in `market-factory.service.spec.ts`'s fakes.
+
 ## Running
 
 ```sh
 cp .env.example .env   # fill in ORACLE_SECRET_KEY, ADMIN_API_KEY at minimum
 npm install
 npm run start:dev      # http://localhost:3001
-npm test                # 42 unit tests
+npm test                # 70 unit tests
 ```
 
 `ORACLE_SECRET_KEY` is the only hard requirement to boot — everything else
