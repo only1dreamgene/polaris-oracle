@@ -73,6 +73,13 @@ export class MarketRepository implements OnModuleDestroy {
     return row ? rowToMarket(row) : undefined;
   }
 
+  getByFeedId(feedId: number): WatchedMarket[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM markets WHERE feed_id = ? ORDER BY created_at DESC`)
+      .all(feedId) as any[];
+    return rows.map(rowToMarket);
+  }
+
   onModuleDestroy(): void {
     this.db.close();
   }

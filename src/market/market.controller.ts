@@ -33,8 +33,11 @@ export class MarketController {
   ) {}
 
   @Get()
-  list() {
-    return this.markets.list();
+  list(@Query('feedId') feedId?: string) {
+    if (feedId === undefined) return this.markets.list();
+    const parsed = Number(feedId);
+    if (Number.isNaN(parsed)) throw new BadRequestException('feedId must be a number');
+    return this.markets.list(parsed);
   }
 
   @Get(':id')

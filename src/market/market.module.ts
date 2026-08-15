@@ -6,6 +6,7 @@ import { WalletController } from './wallet.controller';
 import { EmailAuthController } from './email-auth.controller';
 import { MarketService } from './market.service';
 import { MarketFactoryService } from './market-factory.service';
+import { MarketEvents } from './market-events';
 import { StellarService } from './stellar.service';
 import { OracleService } from './oracle.service';
 import { AuthRelayService } from './auth-relay.service';
@@ -21,6 +22,7 @@ import { EMAIL_SENDER, ConsoleEmailSender, ResendEmailSender } from './email-sen
   providers: [
     MarketService,
     MarketFactoryService,
+    MarketEvents,
     StellarService,
     OracleService,
     AuthRelayService,

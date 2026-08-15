@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { StellarService } from './stellar.service';
 import { OracleService } from './oracle.service';
 import { MarketRepository } from './market.repository';
+import { MarketEvents } from './market-events';
 import type { WatchedMarket } from './market.types';
 
 const SETTLE_TIMEOUT_MS = 30_000;
@@ -31,6 +32,7 @@ export class MarketService implements OnModuleInit {
     private readonly stellar: StellarService,
     private readonly oracle: OracleService,
     private readonly config: ConfigService,
+    private readonly events: MarketEvents,
   ) {}
 
   onModuleInit(): void {
@@ -41,8 +43,8 @@ export class MarketService implements OnModuleInit {
     }
   }
 
-  list(): WatchedMarket[] {
-    return this.repo.getAll();
+  list(feedId?: number): WatchedMarket[] {
+    return feedId === undefined ? this.repo.getAll() : this.repo.getByFeedId(feedId);
   }
 
   get(contractId: string): WatchedMarket | undefined {
@@ -97,8 +99,12 @@ export class MarketService implements OnModuleInit {
     this.logger.log(`scheduled cancel fallback for ${m.contractId} in ${Math.round(delay / 1000)}s`);
   }
 
+  private isTerminal(status: WatchedMarket['status']): boolean {
+    return status === 'settled' || status === 'cancelled';
+  }
+
   private async trySettle(m: WatchedMarket): Promise<void> {
-    if (m.status === 'settled' || m.status === 'cancelled') return;
+    if (this.isTerminal(m.status)) return;
 
     if (!this.oracle.isAvailable) {
       this.logger.warn(`oracle unavailable — scheduling cancel fallback for ${m.contractId}`);
@@ -122,7 +128,7 @@ export class MarketService implements OnModuleInit {
 
   private async tryCancel(m: WatchedMarket): Promise<void> {
     const current = this.repo.getById(m.contractId) ?? m;
-    if (current.status === 'settled' || current.status === 'cancelled') return;
+    if (this.isTerminal(current.status)) return;
 
     try {
       const txHash = await this.stellar.cancel(m.contractId);
@@ -195,9 +201,16 @@ export class MarketService implements OnModuleInit {
   }
 
   private persist(m: WatchedMarket, patch: Partial<WatchedMarket>): void {
+    const wasTerminal = this.isTerminal(m.status);
     const updated: WatchedMarket = { ...m, ...patch, updatedAt: Date.now() };
     this.repo.upsert(updated);
     Object.assign(m, updated);
+    // Only on the actual transition into a terminal state — not on every
+    // persist() touching an already-terminal market — so MarketFactoryService
+    // (listening for this to roll a successor) doesn't attempt one twice.
+    if (!wasTerminal && this.isTerminal(updated.status)) {
+      this.events.emit('finalized', updated);
+    }
   }
 
   private clearTimers(contractId: string): void {

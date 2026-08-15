@@ -52,4 +52,14 @@ describe('MarketRepository', () => {
     const repo = new MarketRepository(':memory:', makeConfig());
     expect(repo.getById('NOPE')).toBeUndefined();
   });
+
+  it('getByFeedId returns only markets for that feed, newest first', () => {
+    const repo = new MarketRepository(':memory:', makeConfig());
+    repo.upsert(sample({ contractId: 'COLD', feedId: 100, createdAt: 1, updatedAt: 1 }));
+    repo.upsert(sample({ contractId: 'CNEW', feedId: 100, createdAt: 2, updatedAt: 2 }));
+    repo.upsert(sample({ contractId: 'COTHER', feedId: 200, createdAt: 3, updatedAt: 3 }));
+
+    expect(repo.getByFeedId(100).map((m) => m.contractId)).toEqual(['CNEW', 'COLD']);
+    expect(repo.getByFeedId(999)).toEqual([]);
+  });
 });

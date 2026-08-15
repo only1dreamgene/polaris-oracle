@@ -161,7 +161,12 @@ export default (): AppConfig => ({
   emailWalletOrigin: process.env.EMAIL_WALLET_ORIGIN ?? 'http://localhost:3000',
   vaultContract: process.env.VAULT_CONTRACT,
   feedCatalog: parseFeedCatalog(process.env.FEED_CATALOG),
-  marketFactoryIntervalSecs: Number(process.env.MARKET_FACTORY_INTERVAL_SECS ?? 6 * 60 * 60), // 6 hours
+  // 5 min: this is now a safety net for a missed 'finalized' event (see
+  // MarketFactoryService), not the primary creation trigger — the common
+  // case is a cheap hasOpenMarket check with no network calls, and staying
+  // well under marketFactoryGracePeriodSecs (1h default) bounds how long a
+  // crash right after expiry could leave a feed dark.
+  marketFactoryIntervalSecs: Number(process.env.MARKET_FACTORY_INTERVAL_SECS ?? 5 * 60),
   marketFactoryExpirySecs: Number(process.env.MARKET_FACTORY_EXPIRY_SECS ?? 24 * 60 * 60), // 24 hours
   marketFactoryGracePeriodSecs: Number(process.env.MARKET_FACTORY_GRACE_PERIOD_SECS ?? 3600),
   marketFactoryBaseFeeBps: Number(process.env.MARKET_FACTORY_BASE_FEE_BPS ?? 100),

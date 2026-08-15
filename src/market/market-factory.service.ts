@@ -2,7 +2,9 @@ import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/commo
 import { ConfigService } from '@nestjs/config';
 import { MarketRepository } from './market.repository';
 import { MarketService } from './market.service';
+import { MarketEvents } from './market-events';
 import { StellarService } from './stellar.service';
+import type { WatchedMarket } from './market.types';
 
 export interface FeedCatalogEntry {
   feedId: number;
@@ -44,18 +46,50 @@ export function hermesPriceToCents(price: string, expo: number): bigint {
 export class MarketFactoryService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(MarketFactoryService.name);
   private timer: NodeJS.Timeout | undefined;
+  // Guards against the periodic sweep and the 'finalized' event both seeing
+  // "no open market" for the same feed around the same moment and both
+  // starting a create — checked+added synchronously with hasOpenMarket in
+  // rollFeed, so there's no await between the check and the reservation.
+  private readonly rolling = new Set<number>();
 
   constructor(
     private readonly repo: MarketRepository,
     private readonly markets: MarketService,
     private readonly stellar: StellarService,
     private readonly config: ConfigService,
+    private readonly events: MarketEvents,
   ) {}
 
   onModuleInit(): void {
+    // Relies on MarketService.onModuleInit() never emitting 'finalized'
+    // *synchronously* during Nest's provider-init tick — true today, since
+    // its fire-and-forget trySettle/tryCancel calls are gated on real I/O
+    // (oracle wait, RPC), so they can't resolve before this listener is
+    // registered a few lines below in the same synchronous tick.
+    this.events.on('finalized', (m: WatchedMarket) => {
+      try {
+        const entry = this.catalogEntry(m.feedId);
+        if (entry) void this.rollFeed(entry);
+      } catch (err) {
+        // EventEmitter doesn't catch listener exceptions itself — an
+        // unhandled one here would become an unhandled rejection, not a
+        // logged, contained failure like everywhere else in this class.
+        this.logger.error(`'finalized' handler failed for ${m.contractId}: ${(err as Error).message}`);
+      }
+    });
+
     const intervalSecs = this.config.get<number>('marketFactoryIntervalSecs')!;
     this.timer = setInterval(() => void this.run(), intervalSecs * 1000);
     this.timer.unref?.();
+
+    // Boot-time reconciliation pass, distinct from the interval above and
+    // from the 'finalized' event: covers the narrow gap neither handles —
+    // a crash strictly between a market's terminal persist() completing and
+    // its successor being created, where the event that would have
+    // triggered it already fired and was lost. (A market that was still
+    // open pre-crash and resolves *during* this boot is covered once
+    // MarketService re-arms it and the event fires, not by this.)
+    void this.run();
   }
 
   onModuleDestroy(): void {
@@ -74,26 +108,51 @@ export class MarketFactoryService implements OnModuleInit, OnModuleDestroy {
     const result: MarketFactoryRunResult = { created: [], skipped: [], failed: [] };
 
     for (const entry of catalog) {
-      if (this.hasOpenMarket(entry.feedId)) {
-        result.skipped.push(entry.symbol);
-        continue;
-      }
-      try {
-        const { contractId, strikePriceCents } = await this.createMarketFor(entry);
-        result.created.push({ symbol: entry.symbol, contractId, strikePriceCents: strikePriceCents.toString() });
-      } catch (err) {
-        const message = (err as Error).message;
-        this.logger.error(`market factory failed for ${entry.symbol}: ${message}`);
-        result.failed.push({ symbol: entry.symbol, error: message });
-      }
+      const outcome = await this.rollFeed(entry);
+      if (outcome.status === 'skipped') result.skipped.push(entry.symbol);
+      else if (outcome.status === 'failed') result.failed.push({ symbol: entry.symbol, error: outcome.error });
+      else result.created.push({ symbol: entry.symbol, contractId: outcome.contractId, strikePriceCents: outcome.strikePriceCents });
     }
     return result;
   }
 
+  /**
+   * Creates a successor for one catalog entry if (and only if) it doesn't
+   * already have an open/pending market and nothing else is already rolling
+   * it — the single entry point both the periodic sweep and the
+   * 'finalized' event call, so there's exactly one place that can start a
+   * creation, not two independently-maintained ones.
+   */
+  private async rollFeed(
+    entry: FeedCatalogEntry,
+  ): Promise<
+    | { status: 'skipped' }
+    | { status: 'failed'; error: string }
+    | { status: 'created'; contractId: string; strikePriceCents: string }
+  > {
+    if (this.hasOpenMarket(entry.feedId) || this.rolling.has(entry.feedId)) {
+      return { status: 'skipped' };
+    }
+    this.rolling.add(entry.feedId);
+    try {
+      const { contractId, strikePriceCents } = await this.createMarketFor(entry);
+      return { status: 'created', contractId, strikePriceCents: strikePriceCents.toString() };
+    } catch (err) {
+      const message = (err as Error).message;
+      this.logger.error(`market factory failed for ${entry.symbol}: ${message}`);
+      return { status: 'failed', error: message };
+    } finally {
+      this.rolling.delete(entry.feedId);
+    }
+  }
+
+  private catalogEntry(feedId: number): FeedCatalogEntry | undefined {
+    const catalog = this.config.get<FeedCatalogEntry[]>('feedCatalog') ?? [];
+    return catalog.find((e) => e.feedId === feedId);
+  }
+
   private hasOpenMarket(feedId: number): boolean {
-    return this.repo
-      .getAll()
-      .some((m) => m.feedId === feedId && (m.status === 'watching' || m.status === 'pending'));
+    return this.repo.getByFeedId(feedId).some((m) => m.status === 'watching' || m.status === 'pending');
   }
 
   private async createMarketFor(entry: FeedCatalogEntry): Promise<{ contractId: string; strikePriceCents: bigint }> {

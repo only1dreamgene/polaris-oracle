@@ -9,7 +9,7 @@ import { AdminGuard } from './admin.guard';
  * on the metadata directly so it's a test failure instead.
  */
 describe('MarketController — admin routes stay guarded', () => {
-  const adminRoutes = ['create', 'watch', 'settle', 'cancel'] as const;
+  const adminRoutes = ['create', 'runFactory', 'watch', 'settle', 'cancel'] as const;
   const publicRoutes = ['list', 'get', 'state', 'position', 'price', 'fee', 'fundFaucet'] as const;
 
   it.each(adminRoutes)('%s carries AdminGuard', (method) => {
