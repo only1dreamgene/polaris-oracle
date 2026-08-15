@@ -15,7 +15,9 @@ See `../polaris-contracts/README.md` for the on-chain half of this system.
 | `auth-relay.service.ts` | Sponsors passkey-authorized calls: this process pays the fee, a WebAuthn passkey signs the Soroban authorization entry, in two HTTP round-trips (`prepare` / `submit`). |
 | `oracle.service.ts` | Pyth Lazer WebSocket client (`@pythnetwork/pyth-lazer-sdk`). Exposes `isAvailable` and `waitForUpdate`. |
 | `market.service.ts` | Settlement orchestration: arms a timer per watched market, falls back to permissionless `cancel` on any failure or oracle outage, re-arms on process restart. |
-| `market-factory.service.ts` | "No human clicks a button" market creation: sweeps a configured feed catalog on an interval, funds each new market's seed liquidity from the capital-efficiency vault instead of a manual admin transfer. See "Market factory automation" below. |
+| `market-factory.service.ts` | "No human clicks a button" market creation: sweeps a configured feed catalog on an interval *and* reacts immediately when a tracked market resolves, funding each new market's seed liquidity from the capital-efficiency vault instead of a manual admin transfer. See "Market factory automation" and "Auto-rolling successor markets" below. |
+| `market-events.ts` | A trivial injectable `MarketEvents extends EventEmitter` — decouples `MarketService` (emits `'finalized'`) from `MarketFactoryService` (listens) without a circular Nest DI dependency. See "Auto-rolling successor markets". |
+| `pyth-price.ts` | Shared Hermes-price fetch/conversion, used by both the factory (a fresh market's strike price) and `MarketService`'s settlement cross-check (see "Multi-oracle settlement cross-check"). |
 | `market.repository.ts` | WAL-journaled SQLite persistence via `better-sqlite3`. |
 | `admin.guard.ts` | `x-admin-key` check, constant-time compare, fails closed if unset. |
 | `faucet.service.ts` | Rate-limited (3/hour/address) Friendbot funding. |
@@ -286,13 +288,114 @@ same live run also turned up bug 8 below; after the fix, re-running
 a tracked open market for that feed now existed — the idempotency check
 works, confirmed live, not just in `market-factory.service.spec.ts`'s fakes.
 
+## Auto-rolling successor markets
+
+"Perpetual markets" here means **auto-rolling**, not a new contract: no
+funding-rate mechanic, no persistent cross-round position — each round is
+still a fully independent, fully-collateralized market like every other one
+in this system. What's automated is *creating the next one*, so a feed never
+sits dark waiting on a human or a slow timer.
+
+`MarketService.persist()` emits a `'finalized'` event (via `MarketEvents`,
+a plain injectable wrapper around Node's `EventEmitter` — not a direct
+dependency on `MarketFactoryService`, which already depends on
+`MarketService` the other way; a real circular dependency would force a 5th
+constructor arg into every one of `market.service.spec.ts`'s 10 direct
+`new MarketService(...)` calls, which don't go through Nest's DI container
+at all) the moment a tracked market *newly* transitions into `settled` or
+`cancelled` — not on every `persist()` call, only the actual transition.
+`MarketFactoryService` listens for it and immediately rolls that feed if
+it's in the catalog, instead of waiting for the periodic sweep.
+
+The periodic sweep still runs (default every 5 minutes, down from the
+factory's original 6-hour cadence — its role changed from "the trigger" to
+"a safety net for a missed event," so the interval needed to shrink to
+match: it should stay well under `MARKET_FACTORY_GRACE_PERIOD_SECS`, or a
+crash right after expiry leaves a feed dark for most of an hour before the
+net even looks). `onModuleInit` also runs one immediate reconciliation pass
+on boot, on top of the timer, for the one gap neither the event nor the
+timer's *first* tick covers: a crash strictly between a market's terminal
+`persist()` and its successor being created, where the event that would
+have triggered it already fired and was lost.
+
+Both paths — the event and the sweep — funnel through one `rollFeed(entry)`,
+which checks `hasOpenMarket` and an in-memory `rolling` set *synchronously*
+(no `await` between the check and reserving the feed) before ever awaiting
+anything, so the event firing at the same moment the sweep is mid-pass can't
+double-create a market for the same feed.
+
+`GET /markets?feedId=` (new `MarketRepository.getByFeedId`) lets a caller —
+the frontend, in particular — find a resolved market's successor once one
+exists, to link "next round" rather than dead-ending.
+
+**Verified live on testnet**: cancelled a short-grace test market and
+confirmed the successor was created within ~1 second via the `'finalized'`
+event path (not the 5-minute sweep), with correct on-chain wiring
+(`treasury` = the vault, funded from it, matching the factory's existing
+verified behavior). Also verified the failure path is handled the way it's
+designed to be, not just in theory: a vault-withdrawal failure during a live
+event-triggered roll (the shared vault was genuinely low on funds from
+repeated testing) was caught, logged with the real on-chain reason
+(`"balance is not sufficient to spend"`), and correctly produced **no**
+underfunded market — confirmed by topping the vault back up and re-running,
+which then succeeded cleanly.
+
+## Multi-oracle settlement cross-check
+
+"Redundant multi-oracle" here means a **Pyth-internal cross-check**
+(Lazer vs. Hermes — two different aggregation/latency paths, not two
+independent providers), not a second on-chain oracle integration. Honest
+about what it does and doesn't catch: both paths ultimately source from
+Pyth's publisher network, so this catches a stale, malformed, or
+individually-wrong read on one path — not a scenario where Pyth itself is
+compromised end to end.
+
+`OracleService.waitForUpdate` now subscribes with `parsed: true`, which
+returns a *decoded* price (`ParsedPayload.priceFeeds[].price`/`exponent`)
+in the exact same WebSocket message that already carries the signed
+`leEcdsa` payload used for settlement — confirmed by reading
+`@pythnetwork/pyth-lazer-sdk`'s own type definitions directly, not assumed.
+No hand-rolled wire-format decoder needed for a second, independently-
+comparable price value.
+
+In `MarketService.trySettle`, if the feed has a `hermesFeedId` in the
+configured catalog, `pyth-price.ts`'s `fetchHermesPriceCents` (shared with
+the factory's strike-price lookup, `AbortSignal`-bounded at 8s — see its own
+doc comment for why an unbounded fetch here used to be a genuine silent-stop
+bug) fetches Hermes' current price. If it diverges from the Lazer-decoded
+price by more than `SETTLE_ORACLE_TOLERANCE_BPS` (default 150 bps = 1.5%,
+deliberately loose — this is a gross-divergence check, not an arbiter of
+normal cross-path noise, and a tight tolerance would turn a defense-in-depth
+check into a new way to needlessly stall a healthy settlement), an error is
+thrown *before* `stellar.settle()` is ever called. That error is handled by
+the exact same machinery bug 6 above added for an unrelated reason —
+`reconcileWithChain` reads live on-chain state (finds the market still
+genuinely `Open`, since nothing was submitted), falls through cleanly, and
+the market gets `persist(pending)` + a scheduled cancel fallback, with zero
+new fallback logic written for this. Any Hermes-fetch failure, timeout, or a
+feed missing from the catalog skips the cross-check entirely and settles on
+Lazer's signature alone, exactly as before this existed — the check must
+never be able to turn a healthy settlement into a stuck one just because
+*it* is unavailable.
+
+**Verification limit, stated plainly rather than implied**: this has **no
+live end-to-end path in this build environment** — same root cause as
+`OracleService.isAvailable` always being `false` here (no real
+`PYTH_LAZER_TOKEN` configured), which means `trySettle` always takes the
+"oracle unavailable" branch straight to `cancel()` and never reaches the
+cross-check at all. Its correctness is covered by 15 unit tests against
+hand-rolled fakes (agreement, tolerance-trip with real bps math, missing
+catalog entry, Hermes failure, Hermes timeout, undefined parsed price) —
+not a live run. Same category of honest limit as the sponsored-relay path
+below.
+
 ## Running
 
 ```sh
 cp .env.example .env   # fill in ORACLE_SECRET_KEY, ADMIN_API_KEY at minimum
 npm install
 npm run start:dev      # http://localhost:3001
-npm test                # 70 unit tests
+npm test                # 84 unit tests
 ```
 
 `ORACLE_SECRET_KEY` is the only hard requirement to boot — everything else
