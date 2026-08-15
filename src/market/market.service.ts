@@ -4,7 +4,9 @@ import { StellarService } from './stellar.service';
 import { OracleService } from './oracle.service';
 import { MarketRepository } from './market.repository';
 import { MarketEvents } from './market-events';
+import { fetchHermesPriceCents } from './pyth-price';
 import type { WatchedMarket } from './market.types';
+import type { FeedCatalogEntry } from './market-factory.service';
 
 const SETTLE_TIMEOUT_MS = 30_000;
 const RECONCILE_READ_ATTEMPTS = 3;
@@ -113,7 +115,8 @@ export class MarketService implements OnModuleInit {
     }
 
     try {
-      const payload = await this.oracle.waitForUpdate(m.feedId, SETTLE_TIMEOUT_MS);
+      const { payload, priceCents: lazerPriceCents } = await this.oracle.waitForUpdate(m.feedId, SETTLE_TIMEOUT_MS);
+      await this.crossCheckAgainstHermes(m, lazerPriceCents);
       const txHash = await this.stellar.settle(m.contractId, payload);
       this.persist(m, { status: 'settled', settleTxHash: txHash, lastError: undefined });
       this.logger.log(`settled ${m.contractId} in tx ${txHash}`);
@@ -144,6 +147,59 @@ export class MarketService implements OnModuleInit {
       this.logger.error(`cancel failed for ${m.contractId}: ${message}`);
       this.persist(m, { status: 'pending', lastError: message });
     }
+  }
+
+  /**
+   * Defense-in-depth on top of the on-chain signature verification, not a
+   * replacement for it: before trusting the Lazer-signed price enough to
+   * submit it, cross-check it against Hermes' independently-fetched
+   * current price for the same feed (see `settleOracleToleranceBps`'s doc
+   * comment in `configuration.ts` for what this does and doesn't catch).
+   *
+   * Throwing here is deliberately just an ordinary settle failure as far
+   * as the caller's existing catch block is concerned — nothing was
+   * submitted yet, so `reconcileWithChain`'s fresh on-chain read correctly
+   * finds the market still `Open` and falls through to
+   * `persist(pending) + scheduleCancelFallback`, the same backstop path
+   * every other settle failure already takes. No special-casing needed.
+   *
+   * Never blocks settlement on its own unavailability: a feed missing from
+   * the catalog, no parsed Lazer price, or a failed/timed-out Hermes fetch
+   * all just skip the check and let settlement proceed on the signature
+   * alone — this must never become a new way for a healthy settlement to
+   * silently stall.
+   */
+  private async crossCheckAgainstHermes(m: WatchedMarket, lazerPriceCents: bigint | undefined): Promise<void> {
+    if (lazerPriceCents === undefined) return;
+    const catalog = this.config.get<FeedCatalogEntry[]>('feedCatalog') ?? [];
+    const entry = catalog.find((e) => e.feedId === m.feedId);
+    if (!entry) return;
+
+    let hermesPriceCents: bigint;
+    try {
+      hermesPriceCents = await fetchHermesPriceCents(this.config.get<string>('pythHermesUrl')!, entry.hermesFeedId);
+    } catch (err) {
+      this.logger.warn(
+        `oracle cross-check skipped for ${m.contractId} (Hermes lookup failed): ${(err as Error).message}`,
+      );
+      return;
+    }
+
+    const diff = lazerPriceCents > hermesPriceCents ? lazerPriceCents - hermesPriceCents : hermesPriceCents - lazerPriceCents;
+    // A real Hermes price of exactly 0 cents is invalid data, not a valid
+    // comparison point — treat it as maximal divergence rather than divide
+    // by zero.
+    const bps = hermesPriceCents === 0n ? 10_000n : (diff * 10_000n) / hermesPriceCents;
+    const toleranceBps = BigInt(this.config.get<number>('settleOracleToleranceBps')!);
+
+    if (bps > toleranceBps) {
+      throw new Error(
+        `oracle cross-check failed: Lazer ${lazerPriceCents}c vs Hermes ${hermesPriceCents}c diverge ${bps}bps > tolerance ${toleranceBps}bps`,
+      );
+    }
+    this.logger.log(
+      `oracle cross-check ok for ${m.contractId}: Lazer ${lazerPriceCents}c vs Hermes ${hermesPriceCents}c (${bps}bps)`,
+    );
   }
 
   /**

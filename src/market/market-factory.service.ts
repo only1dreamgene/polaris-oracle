@@ -4,6 +4,7 @@ import { MarketRepository } from './market.repository';
 import { MarketService } from './market.service';
 import { MarketEvents } from './market-events';
 import { StellarService } from './stellar.service';
+import { fetchHermesPriceCents } from './pyth-price';
 import type { WatchedMarket } from './market.types';
 
 export interface FeedCatalogEntry {
@@ -16,17 +17,6 @@ export interface MarketFactoryRunResult {
   created: { symbol: string; contractId: string; strikePriceCents: string }[];
   skipped: string[];
   failed: { symbol: string; error: string }[];
-}
-
-/** `price * 10^expo` is Hermes' USD value; `* 100` more for cents means `price * 10^(expo+2)`. Rounds to the nearest cent rather than truncating — a floor-biased strike would skew every fresh coin-flip market toward one side by a systematic, silent amount. */
-export function hermesPriceToCents(price: string, expo: number): bigint {
-  const priceStroops = BigInt(price);
-  const scaledExpo = expo + 2;
-  if (scaledExpo >= 0) {
-    return priceStroops * 10n ** BigInt(scaledExpo);
-  }
-  const divisor = 10n ** BigInt(-scaledExpo);
-  return (priceStroops + divisor / 2n) / divisor;
 }
 
 /**
@@ -163,7 +153,8 @@ export class MarketFactoryService implements OnModuleInit, OnModuleDestroy {
       throw new Error('VAULT_CONTRACT, LAZER_CONTRACT and NATIVE_XLM_SAC must be configured for the market factory');
     }
 
-    const strikePriceCents = await this.readCurrentPriceCents(entry.hermesFeedId);
+    const hermesUrl = this.config.get<string>('pythHermesUrl')!;
+    const strikePriceCents = await fetchHermesPriceCents(hermesUrl, entry.hermesFeedId);
     const now = Math.floor(Date.now() / 1000);
     const expiry = now + this.config.get<number>('marketFactoryExpirySecs')!;
     const gracePeriodSecs = this.config.get<number>('marketFactoryGracePeriodSecs')!;
@@ -201,19 +192,5 @@ export class MarketFactoryService implements OnModuleInit, OnModuleDestroy {
 
     this.logger.log(`factory created market ${contractId} for ${entry.symbol} (strike ${strikePriceCents}c)`);
     return { contractId, strikePriceCents };
-  }
-
-  private async readCurrentPriceCents(hermesFeedId: string): Promise<bigint> {
-    const hermesUrl = this.config.get<string>('pythHermesUrl');
-    const res = await fetch(`${hermesUrl}/v2/updates/price/latest?ids[]=${encodeURIComponent(hermesFeedId)}`);
-    if (!res.ok) {
-      throw new Error(`Hermes price lookup failed: ${res.status}`);
-    }
-    const body = (await res.json()) as { parsed?: { price?: { price?: string; expo?: number } }[] };
-    const parsed = body.parsed?.[0]?.price;
-    if (!parsed || parsed.price === undefined || parsed.expo === undefined) {
-      throw new Error(`Hermes returned no parsed price for feed ${hermesFeedId}`);
-    }
-    return hermesPriceToCents(parsed.price, parsed.expo);
   }
 }

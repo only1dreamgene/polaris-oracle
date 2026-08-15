@@ -1,5 +1,5 @@
 import { ConfigService } from '@nestjs/config';
-import { MarketFactoryService, hermesPriceToCents, type FeedCatalogEntry } from './market-factory.service';
+import { MarketFactoryService, type FeedCatalogEntry } from './market-factory.service';
 import { MarketRepository } from './market.repository';
 import { MarketService } from './market.service';
 import { MarketEvents } from './market-events';
@@ -75,22 +75,6 @@ function mockHermesFetch(priceCents: { price: string; expo: number } | 'error' |
     } as unknown as Response;
   }) as unknown as typeof fetch;
 }
-
-describe('hermesPriceToCents', () => {
-  it('scales a typical negative-exponent price into whole cents', () => {
-    // 0.10234567 USD (price=10234567, expo=-8) -> 10.234567 cents -> rounds to 10
-    expect(hermesPriceToCents('10234567', -8)).toBe(10n);
-  });
-
-  it('rounds to the nearest cent instead of truncating', () => {
-    // 0.105 USD -> 10.5 cents -> rounds up to 11, not down to 10
-    expect(hermesPriceToCents('105', -3)).toBe(11n);
-  });
-
-  it('handles a non-negative scaled exponent', () => {
-    expect(hermesPriceToCents('5', 0)).toBe(500n);
-  });
-});
 
 describe('MarketFactoryService — run()', () => {
   afterEach(() => {

@@ -54,7 +54,10 @@ describe('MarketService — settlement orchestration', () => {
   it('settles when the oracle is available and returns a valid payload', async () => {
     const repo = makeRepo();
     const stellar = { settle: jest.fn().mockResolvedValue('TXHASH1'), cancel: jest.fn() };
-    const oracle = { isAvailable: true, waitForUpdate: jest.fn().mockResolvedValue(Buffer.from('payload')) };
+    const oracle = {
+      isAvailable: true,
+      waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('payload'), priceCents: undefined }),
+    };
     const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents());
 
     const m = svc.watch(sample());
@@ -101,7 +104,7 @@ describe('MarketService — settlement orchestration', () => {
         cancel: jest.fn().mockResolvedValue('CANCELTX'),
         getMarketState: jest.fn().mockRejectedValue(new Error('rpc down too')),
       };
-      const oracle = { isAvailable: true, waitForUpdate: jest.fn().mockResolvedValue(Buffer.from('x')) };
+      const oracle = { isAvailable: true, waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('x'), priceCents: undefined }) };
       const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents());
 
       const m = sample({ gracePeriodSecs: 60 });
@@ -134,7 +137,7 @@ describe('MarketService — settlement orchestration', () => {
       cancel: jest.fn(),
       getMarketState: jest.fn().mockResolvedValue({ status: 'ResolvedYes' }),
     };
-    const oracle = { isAvailable: true, waitForUpdate: jest.fn().mockResolvedValue(Buffer.from('x')) };
+    const oracle = { isAvailable: true, waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('x'), priceCents: undefined }) };
     const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents());
 
     const m = sample({ gracePeriodSecs: 60 });
@@ -248,7 +251,7 @@ describe('MarketService — settlement orchestration', () => {
   it('an admin can manually retry settle after a pending failure', async () => {
     const repo = makeRepo();
     const stellar = { settle: jest.fn().mockResolvedValue('RETRYTX'), cancel: jest.fn() };
-    const oracle = { isAvailable: true, waitForUpdate: jest.fn().mockResolvedValue(Buffer.from('x')) };
+    const oracle = { isAvailable: true, waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('x'), priceCents: undefined }) };
     const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents());
 
     const m = sample({ status: 'pending', lastError: 'previous failure' });
@@ -283,5 +286,147 @@ describe('MarketService — settlement orchestration', () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+});
+
+describe('MarketService — oracle cross-check', () => {
+  const XLM_FEED = { feedId: 100, hermesFeedId: '0xfeed', symbol: 'XLM/USD' };
+
+  function makeConfig(overrides: Record<string, unknown> = {}): ConfigService {
+    const values: Record<string, unknown> = {
+      feedCatalog: [XLM_FEED],
+      pythHermesUrl: 'https://hermes.example',
+      settleOracleToleranceBps: 150,
+      ...overrides,
+    };
+    return { get: jest.fn((key: string) => values[key]) } as unknown as ConfigService;
+  }
+
+  function mockHermesFetch(priceCents: { price: string; expo: number } | 'error') {
+    global.fetch = jest.fn(async () => {
+      if (priceCents === 'error') return { ok: false, status: 503 } as Response;
+      return {
+        ok: true,
+        json: async () => ({ parsed: [{ price: { price: priceCents.price, expo: priceCents.expo } }] }),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+  }
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('settles normally when the Lazer and Hermes prices agree within tolerance', async () => {
+    const repo = makeRepo();
+    const stellar = { settle: jest.fn().mockResolvedValue('TXHASH1'), cancel: jest.fn() };
+    // 10000000/-8 -> 10 cents, same as Hermes below — should pass comfortably.
+    const oracle = {
+      isAvailable: true,
+      waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('x'), priceCents: 10n }),
+    };
+    mockHermesFetch({ price: '10000000', expo: -8 });
+    const svc = new MarketService(repo, stellar as any, oracle as any, makeConfig(), new MarketEvents());
+
+    const m = svc.watch(sample());
+    await flushMicrotasks();
+
+    expect(stellar.settle).toHaveBeenCalled();
+    expect(svc.get(m.contractId)?.status).toBe('settled');
+  });
+
+  it('falls back to cancel instead of settling on a gross Lazer/Hermes divergence', async () => {
+    jest.useFakeTimers();
+    try {
+      const repo = makeRepo();
+      const stellar = {
+        settle: jest.fn(),
+        cancel: jest.fn().mockResolvedValue('CANCELTX'),
+        getMarketState: jest.fn().mockResolvedValue({ status: 'Open' }), // nothing was ever submitted
+      };
+      // Lazer says 10 cents, Hermes says 20 cents — 100% apart, way past a 150bps tolerance.
+      const oracle = {
+        isAvailable: true,
+        waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('x'), priceCents: 10n }),
+      };
+      mockHermesFetch({ price: '20000000', expo: -8 });
+      const svc = new MarketService(repo, stellar as any, oracle as any, makeConfig(), new MarketEvents());
+
+      const m = sample({ gracePeriodSecs: 60 });
+      svc.watch(m);
+      await jest.advanceTimersByTimeAsync(500);
+
+      expect(stellar.settle).not.toHaveBeenCalled();
+      expect(svc.get(m.contractId)?.status).toBe('pending');
+      expect(svc.get(m.contractId)?.lastError).toMatch(/oracle cross-check failed/);
+
+      await jest.advanceTimersByTimeAsync(60_000 + 1000);
+
+      expect(stellar.cancel).toHaveBeenCalled();
+      expect(svc.get(m.contractId)?.status).toBe('cancelled');
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('skips the cross-check and settles anyway when the feed is not in the catalog', async () => {
+    const repo = makeRepo();
+    const stellar = { settle: jest.fn().mockResolvedValue('TXHASH1'), cancel: jest.fn() };
+    const oracle = {
+      isAvailable: true,
+      waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('x'), priceCents: 10n }),
+    };
+    const fetchSpy = jest.fn();
+    global.fetch = fetchSpy as unknown as typeof fetch;
+    const svc = new MarketService(
+      repo,
+      stellar as any,
+      oracle as any,
+      makeConfig({ feedCatalog: [] }),
+      new MarketEvents(),
+    );
+
+    const m = svc.watch(sample());
+    await flushMicrotasks();
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(stellar.settle).toHaveBeenCalled();
+    expect(svc.get(m.contractId)?.status).toBe('settled');
+  });
+
+  it('skips the cross-check and settles anyway when the Hermes lookup itself fails', async () => {
+    const repo = makeRepo();
+    const stellar = { settle: jest.fn().mockResolvedValue('TXHASH1'), cancel: jest.fn() };
+    const oracle = {
+      isAvailable: true,
+      waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('x'), priceCents: 10n }),
+    };
+    mockHermesFetch('error');
+    const svc = new MarketService(repo, stellar as any, oracle as any, makeConfig(), new MarketEvents());
+
+    const m = svc.watch(sample());
+    await flushMicrotasks();
+
+    // A cross-check that can't run must never be the reason a healthy settlement stalls.
+    expect(stellar.settle).toHaveBeenCalled();
+    expect(svc.get(m.contractId)?.status).toBe('settled');
+  });
+
+  it('skips the cross-check when Lazer sent no parsed price for this feed', async () => {
+    const repo = makeRepo();
+    const stellar = { settle: jest.fn().mockResolvedValue('TXHASH1'), cancel: jest.fn() };
+    const oracle = {
+      isAvailable: true,
+      waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('x'), priceCents: undefined }),
+    };
+    const fetchSpy = jest.fn();
+    global.fetch = fetchSpy as unknown as typeof fetch;
+    const svc = new MarketService(repo, stellar as any, oracle as any, makeConfig(), new MarketEvents());
+
+    const m = svc.watch(sample());
+    await flushMicrotasks();
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(stellar.settle).toHaveBeenCalled();
+    expect(svc.get(m.contractId)?.status).toBe('settled');
   });
 });

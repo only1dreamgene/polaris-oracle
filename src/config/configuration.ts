@@ -36,23 +36,43 @@ export interface AppConfig {
   vaultContract: string | undefined;
   /**
    * Feeds `MarketFactoryService` creates markets for. Not auto-discovered
-   * from Pyth's catalog — `@pythnetwork/pyth-lazer-sdk` (as installed) is a
-   * subscription client for feed ids/symbols you already know, it has no
-   * feed-catalog/discovery method, and no separate catalog API ships with
-   * it. So this is "no human clicks a button," not "automatically finds
-   * every tradeable asset" — a maintained list, not a live discovery feed.
-   * See `polaris-contracts/README.md`'s vault section for how this fits
-   * into market creation.
+   * from Pyth's catalog: `@pythnetwork/pyth-lazer-sdk` *does* ship a
+   * `getSymbols()` metadata lookup (correcting an earlier, incomplete read
+   * of this SDK — it exists, confirmed straight from
+   * `dist/esm/client.mjs`), but it's an authenticated call gated on
+   * `PYTH_LAZER_TOKEN`, the same optional/paid credential settlement itself
+   * degrades gracefully without — not something worth hard-depending on for
+   * "what feeds exist." So this stays "no human clicks a button," not
+   * "automatically finds every tradeable asset": a maintained list, not a
+   * live discovery feed. See `polaris-contracts/README.md`'s vault section
+   * for how this fits into market creation.
    *
    * `feedId` is the small-integer Pyth Lazer id (`XLM_USD_FEED_ID`'s scheme
    * — what `settle()` subscribes to and what gets stored per market).
    * `hermesFeedId` is the *separate* 32-byte-hex id Pyth's Hermes HTTP API
-   * uses (same distinction `PriceController` already documents) — the
-   * factory reads it once per catalog entry to pick a fresh strike price at
-   * creation time, since nothing in this backend decodes Lazer's signed
-   * `leEcdsa` payload into a plain number outside the contract itself.
+   * uses (same distinction `PriceController` already documents) — read once
+   * per catalog entry to pick a fresh strike price at creation time
+   * (`MarketFactoryService`) and, independently, as a settlement-time
+   * cross-check against the Lazer-signed price (`MarketService.trySettle`,
+   * `settleOracleToleranceBps` below) — the *strike*-price lookup has no
+   * on-chain equivalent to compare against; the *settlement* one does, via
+   * `OracleService.waitForUpdate`'s `parsed: true` decode of the same
+   * `leEcdsa` message.
    */
   feedCatalog: { feedId: number; hermesFeedId: string; symbol: string }[];
+  /**
+   * How far apart (in bps) the Lazer-signed settlement price and Hermes'
+   * independently-fetched current price are allowed to be before
+   * `trySettle` refuses to trust the payload and falls back to `cancel`
+   * instead — defense in depth on top of the on-chain signature
+   * verification, not a replacement for it. Deliberately loose (150 = 1.5%
+   * default): both ultimately source from Pyth, so this is catching a gross
+   * divergence (a stale/wrong feed, a parse bug), not adjudicating normal
+   * cross-path noise between two aggregations of the same publisher
+   * network — a tight tolerance would turn a safety net into a new way to
+   * needlessly stall a healthy settlement.
+   */
+  settleOracleToleranceBps: number;
   marketFactoryIntervalSecs: number;
   marketFactoryExpirySecs: number;
   marketFactoryGracePeriodSecs: number;
@@ -161,6 +181,7 @@ export default (): AppConfig => ({
   emailWalletOrigin: process.env.EMAIL_WALLET_ORIGIN ?? 'http://localhost:3000',
   vaultContract: process.env.VAULT_CONTRACT,
   feedCatalog: parseFeedCatalog(process.env.FEED_CATALOG),
+  settleOracleToleranceBps: Number(process.env.SETTLE_ORACLE_TOLERANCE_BPS ?? 150),
   // 5 min: this is now a safety net for a missed 'finalized' event (see
   // MarketFactoryService), not the primary creation trigger — the common
   // case is a cheap hasOpenMarket check with no network calls, and staying
