@@ -7,7 +7,12 @@
  * second caller needed the exact same conversion.
  */
 
-const HERMES_FETCH_TIMEOUT_MS = 3_000;
+// Confirmed live: a cold first fetch in a freshly-booted process (DNS +
+// TLS + Node's undici lazy-init, before any connection pooling exists yet)
+// took long enough to trip a 3s bound even though a warm `curl` to the same
+// endpoint consistently lands under 1s. 8s stays well inside
+// SETTLE_TIMEOUT_MS's 30s budget while tolerating that one-time cost.
+const HERMES_FETCH_TIMEOUT_MS = 8_000;
 
 /** `price * 10^expo` is the USD value; `* 100` more for cents means `price * 10^(expo+2)`. Rounds to the nearest cent rather than truncating — a floor-biased result would skew every fresh coin-flip market's strike toward one side by a systematic, silent amount, and would bias a settlement cross-check the same way. Same shape for both Hermes' and Pyth Lazer's parsed `{price, exponent}` pairs. */
 export function hermesPriceToCents(price: string, expo: number): bigint {
