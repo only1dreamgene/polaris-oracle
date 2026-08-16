@@ -11,6 +11,21 @@ import type { FeedCatalogEntry } from './market-factory.service';
 const SETTLE_TIMEOUT_MS = 30_000;
 const RECONCILE_READ_ATTEMPTS = 3;
 const RECONCILE_READ_RETRY_DELAY_MS = 750;
+/**
+ * Confirmed live, twice, this session: a timer scheduled to fire exactly at
+ * `expiry`/`grace_period_secs` (computed from this process's wall clock)
+ * can beat the chain to it — the contract checks `now >= ...` against the
+ * *last-closed ledger's* timestamp, which can lag real wall-clock time by
+ * roughly one ledger-close interval (Stellar targets ~5s). A settle/cancel
+ * fired right at that boundary gets a spurious `ExpiryNotReached`/
+ * `GracePeriodNotElapsed` even though the deadline has "already" passed
+ * locally — it self-heals on the next real-world second, but shows up as a
+ * market stuck reporting `pending` with a confusing error until something
+ * retries it. This buffer only affects *scheduled* fires right at the
+ * boundary, not the "already clearly overdue" immediate-fire branches in
+ * `arm()`, which don't need it.
+ */
+const LEDGER_LAG_BUFFER_MS = 8_000;
 
 /**
  * Owns the in-memory timer state that drives settlement automation. The
@@ -82,7 +97,7 @@ export class MarketService implements OnModuleInit {
     this.clearTimers(m.contractId);
 
     if (now < expiryMs) {
-      const timer = setTimeout(() => void this.trySettle(m), expiryMs - now);
+      const timer = setTimeout(() => void this.trySettle(m), expiryMs - now + LEDGER_LAG_BUFFER_MS);
       this.settleTimers.set(m.contractId, timer);
     } else if (now < graceEndMs) {
       void this.trySettle(m);
@@ -93,7 +108,7 @@ export class MarketService implements OnModuleInit {
 
   private scheduleCancelFallback(m: WatchedMarket): void {
     const graceEndMs = m.expiry * 1000 + m.gracePeriodSecs * 1000;
-    const delay = Math.max(0, graceEndMs - Date.now());
+    const delay = Math.max(0, graceEndMs + LEDGER_LAG_BUFFER_MS - Date.now());
     const existing = this.cancelTimers.get(m.contractId);
     if (existing) clearTimeout(existing);
     const timer = setTimeout(() => void this.tryCancel(m), delay);
