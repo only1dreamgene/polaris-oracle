@@ -26,7 +26,7 @@ See `../polaris-contracts/README.md` for the on-chain half of this system.
 
 ## Bugs found by pressure-testing this system
 
-Eight real bugs surfaced by deliberately trying to break this system after
+Ten real bugs surfaced by deliberately trying to break this system after
 it was "done," not just written once and left. Recorded here because each
 one is the kind of thing that looks fine in a code read and only shows up
 under adversarial pressure or a real failure:
@@ -188,6 +188,44 @@ under adversarial pressure or a real failure:
    original submission's hash was never seen). The orphaned market this
    produced live (`CDEBN4JLIKNRZOL4WQQZ6ZAAP2P5PQPJCK6HIITKRN2V46T3IR6JH4W7`)
    was registered manually via `POST /markets/watch` rather than discarded.
+9. **A settle/cancel timer scheduled to fire exactly at its deadline could
+   beat the chain to it.** `arm()`/`scheduleCancelFallback` compute a
+   `setTimeout` delay from this process's own wall clock against
+   `expiry`/`grace_period_secs`, but the contract checks `now >= ...`
+   against the *last-closed ledger's* timestamp, which can lag real time by
+   roughly one ledger-close interval. Confirmed live, twice: a cancel fired
+   right at the computed boundary got a spurious `GracePeriodNotElapsed`
+   even though the deadline had "already" passed locally — harmless (it
+   self-heals on the next real-world second, or the next retry), but it left
+   a market stuck reporting `pending` with a confusing error until something
+   retried it, the exact same *shape* of problem as bugs 3/6/8, just a
+   fourth spot it turned up in. Fixed with a fixed buffer
+   (`LEDGER_LAG_BUFFER_MS`, 8s) added to both scheduled-ahead timers in
+   `market.service.ts` — deliberately not applied to `arm()`'s
+   already-clearly-overdue immediate-fire branches, which don't race this
+   way.
+10. **`contract.Client` calls had zero retry resilience against the exact
+    RPC flakiness the CLI path (bug 7) already retries past.** Every
+    `contract.Client` method does an account-fetch + simulate step before
+    signing or sending anything; confirmed live that this step alone can
+    fail with `Account not found: G...` for an account that demonstrably
+    exists and was used successfully seconds before and after — a genuine
+    testnet RPC hiccup, not a real missing account. `execStellarCli` already
+    retries this class of failure for `deployMarket`'s CLI calls; nothing
+    covered the `contract.Client`-based calls (`getMarketState`,
+    `getPosition`, `settle`, `cancel`, `deployWallet`, `vaultWithdraw`, ...)
+    at all — a single transient blip on any of them surfaced straight to
+    the caller (or, for `settle`/`cancel`, straight into the existing
+    pending/cancel-fallback path, adding an unnecessary delay for what was
+    really just a network hiccup). Fixed with `withRpcRetry`, wrapping only
+    the pre-submission build/simulate step (safe to retry unconditionally —
+    nothing has been sent yet, and a genuine contract-level rejection can't
+    surface there; that only appears via a separate `.unwrap()` call on an
+    already-successfully-returned result, left untouched). Deliberately does
+    **not** wrap `tx.signAndSend()` itself — retrying a send that may have
+    actually landed despite reporting failure is the harder problem
+    `reconcileWithChain` already owns for settle/cancel specifically;
+    blindly retrying the send too could double-submit.
 
 Worth knowing if you add a new on-chain read: `contract.Spec` preserves the
 Rust struct's exact field names (snake_case) and represents enums as
@@ -395,7 +433,7 @@ below.
 cp .env.example .env   # fill in ORACLE_SECRET_KEY, ADMIN_API_KEY at minimum
 npm install
 npm run start:dev      # http://localhost:3001
-npm test                # 84 unit tests
+npm test                # 87 unit tests
 ```
 
 `ORACLE_SECRET_KEY` is the only hard requirement to boot — everything else
