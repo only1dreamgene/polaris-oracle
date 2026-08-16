@@ -11,6 +11,8 @@ const execFileAsync = promisify(execFile);
 
 const CLI_RETRY_ATTEMPTS = 3;
 const CLI_RETRY_DELAY_MS = 2000;
+const RPC_RETRY_ATTEMPTS = 3;
+const RPC_RETRY_DELAY_MS = 1000;
 /** Gives the deployed contract a moment to propagate before `initialize` looks for it — see `deployMarket`. */
 const DEPLOY_TO_INIT_DELAY_MS = 1500;
 
@@ -138,23 +140,58 @@ export class StellarService {
     });
   }
 
+  /**
+   * Every `contract.Client` method does an account-fetch + simulate step
+   * before anything is signed or sent — confirmed live on testnet that this
+   * step alone can fail transiently (`Account not found: G...` for an
+   * account that demonstrably exists and was used seconds before and
+   * after), the same class of RPC flakiness `execStellarCli` already
+   * retries past for the CLI path, just never covered here. Safe to retry
+   * unconditionally, unlike the CLI path's permanent/transient
+   * classification: nothing has been submitted yet at this point, so a
+   * retry can't double-submit anything, and a genuine contract-level
+   * rejection can't surface here at all — that only appears via `.unwrap()`
+   * on an already-successfully-returned `tx.result`, called separately
+   * *after* this resolves, never wrapped by it. Deliberately does NOT wrap
+   * `tx.signAndSend()` — retrying a send that may have actually landed
+   * despite reporting failure is a different, harder problem
+   * (`reconcileWithChain` is how `MarketService` already handles that for
+   * settle/cancel specifically; blindly retrying here could double-submit).
+   */
+  private async withRpcRetry(fn: () => Promise<any>): Promise<any> {
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= RPC_RETRY_ATTEMPTS; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        lastErr = err;
+        if (attempt === RPC_RETRY_ATTEMPTS) throw err;
+        this.logger.warn(
+          `RPC call failed transiently (attempt ${attempt}/${RPC_RETRY_ATTEMPTS}), retrying: ${(err as Error).message}`,
+        );
+        await sleep(RPC_RETRY_DELAY_MS);
+      }
+    }
+    throw lastErr;
+  }
+
   // ---------- reads (simulated, no fee, no signature) ----------
 
   async getMarketState(contractId: string): Promise<OnChainMarket> {
     const client = this.marketClient(contractId);
-    const tx = await (client as any).get_market();
+    const tx = await this.withRpcRetry(() => (client as any).get_market());
     return normalizeMarket(tx.result.unwrap() as RawOnChainMarket);
   }
 
   async getPosition(contractId: string, address: string): Promise<[bigint, bigint]> {
     const client = this.marketClient(contractId);
-    const tx = await (client as any).get_position({ addr: address });
+    const tx = await this.withRpcRetry(() => (client as any).get_position({ addr: address }));
     return tx.result as [bigint, bigint];
   }
 
   async getPrice(contractId: string): Promise<{ yesBps: number; noBps: number }> {
     const client = this.marketClient(contractId);
-    const tx = await (client as any).get_price();
+    const tx = await this.withRpcRetry(() => (client as any).get_price());
     const [yesBps, noBps] = tx.result.unwrap() as [number, number];
     return { yesBps, noBps };
   }
@@ -162,7 +199,7 @@ export class StellarService {
   /** Current effective swap fee (bps) per the market's volume-scaled fee curve — see `get_fee` in the contract. */
   async getFee(contractId: string): Promise<number> {
     const client = this.marketClient(contractId);
-    const tx = await (client as any).get_fee();
+    const tx = await this.withRpcRetry(() => (client as any).get_fee());
     return tx.result.unwrap() as number;
   }
 
@@ -170,14 +207,14 @@ export class StellarService {
 
   async settle(contractId: string, payload: Buffer): Promise<string> {
     const client = this.marketClient(contractId);
-    const tx = await (client as any).settle({ payload });
+    const tx = await this.withRpcRetry(() => (client as any).settle({ payload }));
     const sent = await tx.signAndSend();
     return sent.sendTransactionResponse?.hash ?? sent.getTransactionResponse?.txHash ?? '';
   }
 
   async cancel(contractId: string): Promise<string> {
     const client = this.marketClient(contractId);
-    const tx = await (client as any).cancel();
+    const tx = await this.withRpcRetry(() => (client as any).cancel());
     const sent = await tx.signAndSend();
     return sent.sendTransactionResponse?.hash ?? sent.getTransactionResponse?.txHash ?? '';
   }
@@ -198,7 +235,7 @@ export class StellarService {
    */
   async deployWallet(factoryContractId: string, publicKey: Buffer): Promise<string> {
     const client = this.factoryClient(factoryContractId);
-    const tx = await (client as any).deploy({ public_key: publicKey });
+    const tx = await this.withRpcRetry(() => (client as any).deploy({ public_key: publicKey }));
     const sent = await tx.signAndSend();
     return (sent.result as { unwrap: () => string }).unwrap();
   }
@@ -212,7 +249,9 @@ export class StellarService {
    */
   async initializeFactory(factoryContractId: string, walletWasmHash: Buffer): Promise<string> {
     const client = this.factoryClient(factoryContractId);
-    const tx = await (client as any).initialize({ admin: this.oraclePublicKey, wasm_hash: walletWasmHash });
+    const tx = await this.withRpcRetry(() =>
+      (client as any).initialize({ admin: this.oraclePublicKey, wasm_hash: walletWasmHash }),
+    );
     const sent = await tx.signAndSend();
     (sent.result as { unwrap: () => void }).unwrap();
     return sent.sendTransactionResponse?.hash ?? sent.getTransactionResponse?.txHash ?? '';
@@ -229,7 +268,7 @@ export class StellarService {
    */
   async resolveWallet(factoryContractId: string, publicKey: Buffer): Promise<string> {
     const client = this.factoryClient(factoryContractId);
-    const tx = await (client as any).resolve({ public_key: publicKey });
+    const tx = await this.withRpcRetry(() => (client as any).resolve({ public_key: publicKey }));
     return tx.result as string;
   }
 
@@ -244,18 +283,20 @@ export class StellarService {
   /** Available capital, in stroops — checked before `MarketFactoryService` withdraws to seed a new market, so an underfunded vault fails loudly instead of a partial/confusing on-chain error. */
   async vaultBalance(vaultContractId: string): Promise<bigint> {
     const client = this.vaultClient(vaultContractId);
-    const tx = await (client as any).get_balance();
+    const tx = await this.withRpcRetry(() => (client as any).get_balance());
     return (tx.result as { unwrap: () => bigint }).unwrap();
   }
 
   /** Moves `amount` stroops from the vault to this process's own account, to fund a new market's `initial_liquidity` — the same account `deployMarket` already transfers that liquidity from. */
   async vaultWithdraw(vaultContractId: string, amount: bigint): Promise<string> {
     const client = this.vaultClient(vaultContractId);
-    const tx = await (client as any).withdraw({
-      admin: this.oraclePublicKey,
-      to: this.oraclePublicKey,
-      amount,
-    });
+    const tx = await this.withRpcRetry(() =>
+      (client as any).withdraw({
+        admin: this.oraclePublicKey,
+        to: this.oraclePublicKey,
+        amount,
+      }),
+    );
     const sent = await tx.signAndSend();
     (sent.result as { unwrap: () => void }).unwrap();
     return sent.sendTransactionResponse?.hash ?? sent.getTransactionResponse?.txHash ?? '';
