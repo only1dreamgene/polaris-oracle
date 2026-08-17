@@ -227,6 +227,12 @@ under adversarial pressure or a real failure:
     `reconcileWithChain` already owns for settle/cancel specifically;
     blindly retrying the send too could double-submit.
 
+Bugs 9 and 10 together re-verified live after both fixes landed: a fresh
+short-grace test market ran its full expiry → grace → cancel cycle in one
+clean pass — no `GracePeriodNotElapsed`, no `Account not found`, no retry
+warnings logged at all — where the same cycle had needed either a manual
+retry or produced a stuck `pending` status before.
+
 Worth knowing if you add a new on-chain read: `contract.Spec` preserves the
 Rust struct's exact field names (snake_case) and represents enums as
 `{ tag: 'Open' }` rather than a bare string — it does **not** camelCase
