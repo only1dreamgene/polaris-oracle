@@ -77,6 +77,18 @@ export interface AppConfig {
    * needlessly stall a healthy settlement.
    */
   settleOracleToleranceBps: number;
+  /**
+   * `Market.reflector` — the on-chain second-oracle enforcement `settle()`
+   * itself now performs (see `polaris-contracts/README.md`'s "On-chain
+   * second-oracle: Reflector Network"), distinct from
+   * `settleOracleToleranceBps` above (that's the *earlier, off-chain*
+   * Lazer-vs-Hermes advisory check, still separately in place). These four
+   * become `initialize`'s 12th parameter for every newly-deployed market.
+   */
+  reflectorContract: string | undefined;
+  reflectorAsset: string;
+  reflectorMaxStalenessSecs: string;
+  reflectorToleranceBps: number;
   marketFactoryIntervalSecs: number;
   marketFactoryExpirySecs: number;
   marketFactoryGracePeriodSecs: number;
@@ -188,6 +200,13 @@ export default (): AppConfig => ({
   vaultContract: process.env.VAULT_CONTRACT,
   feedCatalog: parseFeedCatalog(process.env.FEED_CATALOG),
   settleOracleToleranceBps: Number(process.env.SETTLE_ORACLE_TOLERANCE_BPS ?? 150),
+  reflectorContract: process.env.REFLECTOR_CONTRACT,
+  reflectorAsset: process.env.REFLECTOR_ASSET ?? 'XLM',
+  // Comfortably above the real Reflector testnet oracle's own resolution()
+  // (300s, confirmed live) — initialize() itself also validates this
+  // on-chain against whatever the configured instance actually reports.
+  reflectorMaxStalenessSecs: process.env.REFLECTOR_MAX_STALENESS_SECS ?? '600',
+  reflectorToleranceBps: Number(process.env.REFLECTOR_TOLERANCE_BPS ?? 150),
   // 5 min: this is now a safety net for a missed 'finalized' event (see
   // MarketFactoryService), not the primary creation trigger — the common
   // case is a cheap hasOpenMarket check with no network calls, and staying

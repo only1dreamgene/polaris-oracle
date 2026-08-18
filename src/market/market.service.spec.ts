@@ -109,18 +109,51 @@ describe('MarketService — settlement orchestration', () => {
 
       const m = sample({ gracePeriodSecs: 60 });
       svc.watch(m);
-      // reconcileWithChain's read retries use a real setTimeout between
-      // attempts (see RECONCILE_READ_RETRY_DELAY_MS) — advance fake timers
-      // past those before asserting, not just microtasks.
-      await jest.advanceTimersByTimeAsync(2000);
+      // trySettle now retries a failed attempt SETTLE_RETRY_ATTEMPTS times
+      // (75s apart) before giving up — by the time the last attempt fails,
+      // the grace period (60s) has long since elapsed, so
+      // scheduleCancelFallback's own delay clamps to ~0 and cancellation
+      // follows immediately within the same advance. Assert the retries
+      // actually happened (not just the end state) and that nothing got
+      // stranded along the way.
+      await jest.advanceTimersByTimeAsync(300_000);
 
-      expect(svc.get(m.contractId)?.status).toBe('pending');
-      expect(svc.get(m.contractId)?.lastError).toMatch(/rpc exploded/);
-
-      await jest.advanceTimersByTimeAsync(60_000 + 1000);
-
+      expect(stellar.settle).toHaveBeenCalledTimes(3); // SETTLE_RETRY_ATTEMPTS
       expect(stellar.cancel).toHaveBeenCalled();
       expect(svc.get(m.contractId)?.status).toBe('cancelled');
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('recovers from a transient settle failure on retry instead of falling straight to cancel', async () => {
+    // The whole reason trySettle retries at all now: a blip that clears up
+    // on its own (e.g. a Reflector staleness window that rolls forward)
+    // shouldn't be treated identically to a permanent divergence. First
+    // attempt fails, second succeeds — must end up settled, and must not
+    // have scheduled a cancel fallback along the way.
+    jest.useFakeTimers();
+    try {
+      const repo = makeRepo();
+      const stellar = {
+        settle: jest.fn().mockRejectedValueOnce(new Error('transient blip')).mockResolvedValueOnce('TXHASH1'),
+        cancel: jest.fn(),
+        getMarketState: jest.fn().mockRejectedValue(new Error('rpc down too')), // nothing to reconcile against yet
+      };
+      const oracle = {
+        isAvailable: true,
+        waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('x'), priceCents: undefined }),
+      };
+      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents());
+
+      const m = sample({ gracePeriodSecs: 3600 }); // long grace — retries must land well inside it
+      svc.watch(m);
+      await jest.advanceTimersByTimeAsync(80_000); // past the single 75s inter-attempt delay + reconcileWithChain's own read-retry overhead
+
+      expect(stellar.settle).toHaveBeenCalledTimes(2);
+      expect(svc.get(m.contractId)?.status).toBe('settled');
+      expect(svc.get(m.contractId)?.settleTxHash).toBe('TXHASH1');
+      expect(stellar.cancel).not.toHaveBeenCalled();
     } finally {
       jest.useRealTimers();
     }
@@ -353,14 +386,15 @@ describe('MarketService — oracle cross-check', () => {
 
       const m = sample({ gracePeriodSecs: 60 });
       svc.watch(m);
-      await jest.advanceTimersByTimeAsync(500);
+      // trySettle retries a failed attempt SETTLE_RETRY_ATTEMPTS times (75s
+      // apart) before giving up — a persistent divergence fails identically
+      // on every attempt (proven by waitForUpdate being called 3 times, not
+      // just once), and by the time the retries are exhausted the grace
+      // period has long since elapsed, so cancellation follows immediately.
+      await jest.advanceTimersByTimeAsync(300_000);
 
       expect(stellar.settle).not.toHaveBeenCalled();
-      expect(svc.get(m.contractId)?.status).toBe('pending');
-      expect(svc.get(m.contractId)?.lastError).toMatch(/oracle cross-check failed/);
-
-      await jest.advanceTimersByTimeAsync(60_000 + 1000);
-
+      expect(oracle.waitForUpdate).toHaveBeenCalledTimes(3); // SETTLE_RETRY_ATTEMPTS
       expect(stellar.cancel).toHaveBeenCalled();
       expect(svc.get(m.contractId)?.status).toBe('cancelled');
     } finally {

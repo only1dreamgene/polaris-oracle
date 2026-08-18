@@ -384,7 +384,7 @@ repeated testing) was caught, logged with the real on-chain reason
 underfunded market — confirmed by topping the vault back up and re-running,
 which then succeeded cleanly.
 
-## Multi-oracle settlement cross-check
+## Off-chain multi-oracle settlement cross-check (Pyth-internal)
 
 "Redundant multi-oracle" here means a **Pyth-internal cross-check**
 (Lazer vs. Hermes — two different aggregation/latency paths, not two
@@ -433,13 +433,59 @@ catalog entry, Hermes failure, Hermes timeout, undefined parsed price) —
 not a live run. Same category of honest limit as the sponsored-relay path
 below.
 
+## On-chain second-oracle enforcement (Reflector Network)
+
+Distinct from the off-chain check above, and stronger: `contracts/market`'s
+`settle()` itself now requires a genuinely independent oracle (Reflector
+Network — different node operators, different data pipeline, not just a
+different Pyth product line) to agree with the Lazer-signed price before
+finalizing, enforced by the contract, not this backend. See
+`polaris-contracts/README.md`'s "On-chain second-oracle: Reflector Network"
+for the full design, the live verification of Reflector's testnet
+deployment, and why it fails closed rather than gracefully degrading (the
+opposite of the off-chain check above, deliberately).
+
+This backend's role is just threading `Market.reflector`'s four settings
+through to every newly-deployed market — `CreateMarketParams` gained
+`reflectorContract`/`reflectorAsset`/`reflectorMaxStalenessSecs`/
+`reflectorToleranceBps`, `StellarService.deployMarket`'s CLI `initialize`
+call passes them as a JSON-encoded `--reflector` struct arg (Stellar CLI's
+way of taking a `contracttype` param), and both `MarketController.create()`
+and `MarketFactoryService.createMarketFor` read them from config
+(`REFLECTOR_CONTRACT` has no safe default — both refuse to deploy without
+it configured, same fail-closed shape as `LAZER_CONTRACT`/`NATIVE_XLM_SAC`).
+
+**A real gap this surfaced, fixed alongside it**: `MarketService.trySettle`
+used to have zero retry — one failure went straight to
+`scheduleCancelFallback`. Fine when every failure mode was essentially
+permanent, but the on-chain Reflector check adds one that plausibly isn't
+— a single missed 5-minute Reflector update cycle landing badly is likely
+self-healing within a couple of minutes, and treating it identically to a
+genuine permanent divergence means refunding a market that would have
+resolved fine shortly after. `trySettle` now retries a failed attempt up
+to `SETTLE_RETRY_ATTEMPTS` (3) times, `SETTLE_RETRY_DELAY_MS` (75s) apart,
+before falling through to the cancel fallback — a real market's grace
+period is comfortably longer than this whole retry budget, and
+`reconcileWithChain` still runs after every attempt (not just the last),
+so a hidden on-chain success is still caught immediately rather than
+wasting a retry on it.
+
+Both new behaviors have dedicated unit tests: `trySettle` recovering from
+a transient failure on the second attempt without ever scheduling a
+cancel fallback, and a persistent failure correctly exhausting all three
+attempts (`stellar.settle`/`oracle.waitForUpdate` call counts asserted
+directly, not just the end state — the intermediate `'pending'` status is
+now too transient to assert cleanly with fake timers once retries are
+involved, since the cancel fallback's own delay clamps to ~0 by the time
+retries exhaust for a short-grace test market).
+
 ## Running
 
 ```sh
 cp .env.example .env   # fill in ORACLE_SECRET_KEY, ADMIN_API_KEY at minimum
 npm install
 npm run start:dev      # http://localhost:3001
-npm test                # 87 unit tests
+npm test                # 91 unit tests
 ```
 
 `ORACLE_SECRET_KEY` is the only hard requirement to boot — everything else

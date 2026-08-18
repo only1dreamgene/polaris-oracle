@@ -62,6 +62,11 @@ export interface CreateMarketParams {
   treasury: string;
   initialLiquidityStroops: bigint;
   collateralAsset: string;
+  /** On-chain second-oracle settings — `initialize`'s 12th param, see `polaris-contracts/README.md`'s "On-chain second-oracle: Reflector Network". */
+  reflectorContract: string;
+  reflectorAsset: string;
+  reflectorMaxStalenessSecs: bigint;
+  reflectorToleranceBps: number;
 }
 
 /**
@@ -411,6 +416,13 @@ export class StellarService {
       params.treasury,
       '--initial_liquidity',
       params.initialLiquidityStroops.toString(),
+      '--reflector',
+      JSON.stringify({
+        contract: params.reflectorContract,
+        asset: params.reflectorAsset,
+        max_staleness_secs: params.reflectorMaxStalenessSecs.toString(),
+        tolerance_bps: params.reflectorToleranceBps,
+      }),
     ];
 
     try {

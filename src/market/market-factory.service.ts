@@ -149,8 +149,11 @@ export class MarketFactoryService implements OnModuleInit, OnModuleDestroy {
     const vaultContract = this.config.get<string>('vaultContract');
     const lazerContract = this.config.get<string>('lazerContract');
     const nativeXlmSac = this.config.get<string>('nativeXlmSac');
-    if (!vaultContract || !lazerContract || !nativeXlmSac) {
-      throw new Error('VAULT_CONTRACT, LAZER_CONTRACT and NATIVE_XLM_SAC must be configured for the market factory');
+    const reflectorContract = this.config.get<string>('reflectorContract');
+    if (!vaultContract || !lazerContract || !nativeXlmSac || !reflectorContract) {
+      throw new Error(
+        'VAULT_CONTRACT, LAZER_CONTRACT, NATIVE_XLM_SAC, and REFLECTOR_CONTRACT must be configured for the market factory',
+      );
     }
 
     const hermesUrl = this.config.get<string>('pythHermesUrl')!;
@@ -180,6 +183,10 @@ export class MarketFactoryService implements OnModuleInit, OnModuleDestroy {
       treasury: vaultContract,
       initialLiquidityStroops,
       collateralAsset: nativeXlmSac,
+      reflectorContract,
+      reflectorAsset: this.config.get<string>('reflectorAsset')!,
+      reflectorMaxStalenessSecs: BigInt(this.config.get<string>('reflectorMaxStalenessSecs')!),
+      reflectorToleranceBps: this.config.get<number>('reflectorToleranceBps')!,
     });
 
     this.markets.watch({

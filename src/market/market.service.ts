@@ -12,6 +12,21 @@ const SETTLE_TIMEOUT_MS = 30_000;
 const RECONCILE_READ_ATTEMPTS = 3;
 const RECONCILE_READ_RETRY_DELAY_MS = 750;
 /**
+ * `settle()` failing once used to go straight to `scheduleCancelFallback`
+ * with no retry at all — fine when every failure mode was essentially
+ * permanent (bad payload, wrong feed), but the on-chain Reflector
+ * cross-check (see `polaris-contracts/README.md`) adds one that plausibly
+ * isn't: a single missed 5-minute Reflector update cycle landing badly is
+ * likely self-healing within a couple of minutes, and treating it
+ * identically to a genuine permanent divergence means refunding a market
+ * that would have resolved fine shortly after. A few retries, spaced out,
+ * costs little (a real market's grace period is comfortably longer than
+ * this whole retry budget) and gives a transient blip room to clear before
+ * falling through to the cancel fallback.
+ */
+const SETTLE_RETRY_ATTEMPTS = 3;
+const SETTLE_RETRY_DELAY_MS = 75_000;
+/**
  * Confirmed live, twice, this session: a timer scheduled to fire exactly at
  * `expiry`/`grace_period_secs` (computed from this process's wall clock)
  * can beat the chain to it — the contract checks `now >= ...` against the
@@ -129,18 +144,28 @@ export class MarketService implements OnModuleInit {
       return;
     }
 
-    try {
-      const { payload, priceCents: lazerPriceCents } = await this.oracle.waitForUpdate(m.feedId, SETTLE_TIMEOUT_MS);
-      await this.crossCheckAgainstHermes(m, lazerPriceCents);
-      const txHash = await this.stellar.settle(m.contractId, payload);
-      this.persist(m, { status: 'settled', settleTxHash: txHash, lastError: undefined });
-      this.logger.log(`settled ${m.contractId} in tx ${txHash}`);
-    } catch (err) {
-      const message = (err as Error).message;
-      if (await this.reconcileWithChain(m)) return;
-      this.logger.error(`settle failed for ${m.contractId}: ${message}`);
-      this.persist(m, { status: 'pending', lastError: message });
-      this.scheduleCancelFallback(m);
+    for (let attempt = 1; attempt <= SETTLE_RETRY_ATTEMPTS; attempt++) {
+      try {
+        const { payload, priceCents: lazerPriceCents } = await this.oracle.waitForUpdate(m.feedId, SETTLE_TIMEOUT_MS);
+        await this.crossCheckAgainstHermes(m, lazerPriceCents);
+        const txHash = await this.stellar.settle(m.contractId, payload);
+        this.persist(m, { status: 'settled', settleTxHash: txHash, lastError: undefined });
+        this.logger.log(`settled ${m.contractId} in tx ${txHash}`);
+        return;
+      } catch (err) {
+        const message = (err as Error).message;
+        if (await this.reconcileWithChain(m)) return;
+        if (attempt < SETTLE_RETRY_ATTEMPTS) {
+          this.logger.warn(
+            `settle attempt ${attempt}/${SETTLE_RETRY_ATTEMPTS} failed for ${m.contractId}, retrying in ${SETTLE_RETRY_DELAY_MS / 1000}s: ${message}`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, SETTLE_RETRY_DELAY_MS));
+          continue;
+        }
+        this.logger.error(`settle failed for ${m.contractId} after ${SETTLE_RETRY_ATTEMPTS} attempts: ${message}`);
+        this.persist(m, { status: 'pending', lastError: message });
+        this.scheduleCancelFallback(m);
+      }
     }
   }
 

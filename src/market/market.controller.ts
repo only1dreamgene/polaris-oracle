@@ -88,8 +88,11 @@ export class MarketController {
     const nativeXlmSac = this.config.get<string>('nativeXlmSac');
     const treasury = this.config.get<string>('treasuryAddress') ?? this.stellar.oraclePublicKey;
     const feedId = this.config.get<number>('xlmUsdFeedId')!;
-    if (!lazerContract || !nativeXlmSac) {
-      throw new BadRequestException('LAZER_CONTRACT and NATIVE_XLM_SAC must be configured to create a market');
+    const reflectorContract = this.config.get<string>('reflectorContract');
+    if (!lazerContract || !nativeXlmSac || !reflectorContract) {
+      throw new BadRequestException(
+        'LAZER_CONTRACT, NATIVE_XLM_SAC, and REFLECTOR_CONTRACT must be configured to create a market',
+      );
     }
 
     const { contractId, initTxHash } = await this.stellar.deployMarket({
@@ -103,6 +106,10 @@ export class MarketController {
       treasury,
       initialLiquidityStroops: BigInt(dto.initialLiquidityStroops),
       collateralAsset: nativeXlmSac,
+      reflectorContract,
+      reflectorAsset: this.config.get<string>('reflectorAsset')!,
+      reflectorMaxStalenessSecs: BigInt(this.config.get<string>('reflectorMaxStalenessSecs')!),
+      reflectorToleranceBps: this.config.get<number>('reflectorToleranceBps')!,
     });
 
     const watched = this.markets.watch({
