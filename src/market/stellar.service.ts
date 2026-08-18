@@ -85,6 +85,23 @@ export class StellarService {
   readonly server: rpc.Server;
   private readonly keypair: Keypair;
   private readonly secretKey: string;
+  /**
+   * Deploy-time identity, separate from `keypair` (settle/cancel/vault
+   * calls/wallet deploys — everything that stays online and signs
+   * continuously). `DEPLOYER_SECRET_KEY` is optional and falls back to the
+   * same key as everything else if unset, same graceful-degrade shape as
+   * every other optional config here. Splitting these out is uniquely
+   * low-risk for this contract specifically: `Market.admin` (set once at
+   * `initialize()`) is never checked again by any other entrypoint —
+   * `split`/`merge`/`buy`/`sell`/`transfer`/`redeem` all require the
+   * *caller's* own auth, `settle`/`cancel` are fully permissionless — so a
+   * deploy-only key plays no ongoing role after the one `initialize()` call
+   * it signs. Real (if modest) benefit: if the always-hot settlement key is
+   * ever compromised, it can't be used to deploy new markets claiming this
+   * system's trusted admin identity.
+   */
+  private readonly deployerKeypair: Keypair;
+  private readonly deployerSecretKey: string;
   readonly networkPassphrase: string;
   readonly rpcUrl: string;
 
@@ -95,6 +112,9 @@ export class StellarService {
     }
     this.secretKey = secret;
     this.keypair = Keypair.fromSecret(secret);
+    const deployerSecret = this.config.get<string>('deployerSecretKey') ?? secret;
+    this.deployerSecretKey = deployerSecret;
+    this.deployerKeypair = Keypair.fromSecret(deployerSecret);
     this.networkPassphrase = this.config.get<string>('stellarNetworkPassphrase')!;
     this.rpcUrl = this.config.get<string>('stellarRpcUrl')!;
     this.server = new rpc.Server(this.rpcUrl, { allowHttp: this.rpcUrl.startsWith('http://') });
@@ -102,6 +122,10 @@ export class StellarService {
 
   get oraclePublicKey(): string {
     return this.keypair.publicKey();
+  }
+
+  get deployerPublicKey(): string {
+    return this.deployerKeypair.publicKey();
   }
 
   private marketClient(contractId: string) {
@@ -319,15 +343,12 @@ export class StellarService {
   // likely to silently misbehave if hand-rolled blind.
   //
   // `--source` is passed the raw secret directly (the CLI accepts a secret
-  // key or seed phrase as an alternative to a named identity) rather than a
-  // separately-provisioned "deployer" identity: `initialize`'s `admin`
-  // parameter is set to this same key's public address below, and
-  // `admin.require_auth()` needs whichever key signs this transaction to
-  // match it. Using one keypair for both online settlement and deployment
-  // also means there's no `DEPLOYER_SEED_PHRASE` to provision at container
-  // startup — one less moving part than a separate cold deploy key would
-  // need, appropriate for a testnet build (a production deployment with
-  // real value at stake would reasonably want these separated again).
+  // key or seed phrase as an alternative to a named identity). Uses
+  // `deployerSecretKey`/`deployerPublicKey`, not the main oracle key —
+  // `initialize`'s `admin` parameter is set to the *deployer's* public
+  // address below, and `admin.require_auth()` needs whichever key signs
+  // this transaction to match it. See the field doc comment on
+  // `deployerKeypair` for why this split is safe and worth having.
   async deployMarket(params: CreateMarketParams): Promise<{ contractId: string; initTxHash: string }> {
     const network = this.config.get<string>('stellarNetwork')!;
     const deploy = await this.execStellarCli([
@@ -336,7 +357,7 @@ export class StellarService {
       '--wasm',
       'wasm/polaris_market.wasm',
       '--source',
-      this.secretKey,
+      this.deployerSecretKey,
       '--network',
       network,
       '--rpc-url',
@@ -359,7 +380,7 @@ export class StellarService {
       '--id',
       contractId,
       '--source',
-      this.secretKey,
+      this.deployerSecretKey,
       '--network',
       network,
       '--rpc-url',
@@ -369,7 +390,7 @@ export class StellarService {
       '--',
       'initialize',
       '--admin',
-      this.oraclePublicKey,
+      this.deployerPublicKey,
       '--collateral',
       params.collateralAsset,
       '--strike_price',

@@ -11,6 +11,7 @@ import { StellarService } from './stellar.service';
 import { OracleService } from './oracle.service';
 import { AuthRelayService } from './auth-relay.service';
 import { FaucetService } from './faucet.service';
+import { WalletDeployRateLimiter } from './wallet-deploy-rate-limiter.service';
 import { EmailAuthService } from './email-auth.service';
 import { AdminGuard } from './admin.guard';
 import { MarketRepository, MARKETS_DB_PATH } from './market.repository';
@@ -27,6 +28,7 @@ import { EMAIL_SENDER, ConsoleEmailSender, ResendEmailSender } from './email-sen
     OracleService,
     AuthRelayService,
     FaucetService,
+    WalletDeployRateLimiter,
     EmailAuthService,
     AdminGuard,
     MarketRepository,

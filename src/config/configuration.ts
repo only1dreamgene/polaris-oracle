@@ -1,6 +1,8 @@
 export interface AppConfig {
   port: number;
   oracleSecretKey: string;
+  /** Optional separate identity for market deployment only — falls back to `oracleSecretKey` if unset. See `StellarService`'s `deployerKeypair` doc comment for why splitting this out is safe and worth it. */
+  deployerSecretKey: string | undefined;
   adminApiKey: string;
   pythLazerToken: string | undefined;
   pythLazerWsUrl: string;
@@ -20,6 +22,8 @@ export interface AppConfig {
   friendbotUrl: string;
   faucetAmountStroops: string;
   faucetMaxPerHour: number;
+  /** IP-keyed limit on POST /wallets/deploy — mitigates, doesn't close, the known unauthenticated-endpoint gap (see WalletDeployRateLimiter). */
+  walletDeployMaxPerHour: number;
   settleFreshnessWindowSecs: number;
   emailWalletEncKeyHex: string;
   sessionJwtSecret: string;
@@ -140,6 +144,7 @@ function parseFeedCatalog(raw: string | undefined): { feedId: number; hermesFeed
 export default (): AppConfig => ({
   port: Number(process.env.PORT ?? 3000),
   oracleSecretKey: process.env.ORACLE_SECRET_KEY ?? '',
+  deployerSecretKey: process.env.DEPLOYER_SECRET_KEY,
   adminApiKey: process.env.ADMIN_API_KEY ?? '',
   pythLazerToken: process.env.PYTH_LAZER_TOKEN,
   pythLazerWsUrl: process.env.PYTH_LAZER_WS_URL ?? 'wss://pyth-lazer.dourolabs.app/v1/stream',
@@ -165,6 +170,7 @@ export default (): AppConfig => ({
   friendbotUrl: process.env.FRIENDBOT_URL ?? 'https://friendbot.stellar.org',
   faucetAmountStroops: process.env.FAUCET_AMOUNT_STROOPS ?? '5000000000', // 500 XLM
   faucetMaxPerHour: Number(process.env.FAUCET_MAX_PER_HOUR ?? 3),
+  walletDeployMaxPerHour: Number(process.env.WALLET_DEPLOY_MAX_PER_HOUR ?? 5),
   settleFreshnessWindowSecs: Number(process.env.SETTLE_FRESHNESS_WINDOW_SECS ?? 300),
   // 32 bytes hex = AES-256-GCM key, encrypting custodial private keys at rest.
   emailWalletEncKeyHex: devFallbackSecret('EMAIL_WALLET_ENC_KEY', 32),

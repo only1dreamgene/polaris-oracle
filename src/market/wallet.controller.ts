@@ -1,7 +1,9 @@
-import { BadRequestException, Body, Controller, Get, Post, Query } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, HttpException, HttpStatus, Post, Query, Req } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import type { Request } from 'express';
 import { StellarService } from './stellar.service';
 import { AuthRelayService } from './auth-relay.service';
+import { WalletDeployRateLimiter } from './wallet-deploy-rate-limiter.service';
 import { DeployWalletDto } from './dto/deploy-wallet.dto';
 import { PrepareAuthDto } from './dto/prepare-auth.dto';
 import { SubmitAuthDto } from './dto/submit-auth.dto';
@@ -17,6 +19,7 @@ export class WalletController {
     private readonly stellar: StellarService,
     private readonly relay: AuthRelayService,
     private readonly config: ConfigService,
+    private readonly deployRateLimiter: WalletDeployRateLimiter,
   ) {}
 
   /**
@@ -39,7 +42,10 @@ export class WalletController {
   }
 
   @Post('deploy')
-  async deploy(@Body() dto: DeployWalletDto) {
+  async deploy(@Req() req: Request, @Body() dto: DeployWalletDto) {
+    if (!this.deployRateLimiter.tryConsume(req.ip ?? 'unknown')) {
+      throw new HttpException('wallet deploy rate limit exceeded — try again in an hour', HttpStatus.TOO_MANY_REQUESTS);
+    }
     const factoryId = this.config.get<string>('smartWalletFactoryContract');
     if (!factoryId) {
       throw new BadRequestException('SMART_WALLET_FACTORY_CONTRACT must be configured to deploy wallets');
