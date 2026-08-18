@@ -70,6 +70,27 @@ export interface CreateMarketParams {
 }
 
 /**
+ * The `--reflector` CLI arg for `deployMarket`'s `initialize` call — a
+ * JSON-encoded `ReflectorConfig` struct. `max_staleness_secs` must be a
+ * bare JSON number, not a quoted string, confirmed live: the CLI's
+ * struct-arg parser rejected `"600"` with "unknown variant `600`". Safe to
+ * convert the bigint directly here — this field is always a small
+ * staleness window in seconds, nowhere near JS's safe-integer ceiling,
+ * unlike the bigints passed as CLI *scalar* flags elsewhere in
+ * `deployMarket`, which correctly stay strings.
+ */
+export function buildReflectorConfigArg(
+  params: Pick<CreateMarketParams, 'reflectorContract' | 'reflectorAsset' | 'reflectorMaxStalenessSecs' | 'reflectorToleranceBps'>,
+): string {
+  return JSON.stringify({
+    contract: params.reflectorContract,
+    asset: params.reflectorAsset,
+    max_staleness_secs: Number(params.reflectorMaxStalenessSecs),
+    tolerance_bps: params.reflectorToleranceBps,
+  });
+}
+
+/**
  * All Stellar/Soroban I/O lives here: reads (via RPC simulation, no fee, no
  * signature), oracle-authorized writes (settle/cancel/wallet deploy, signed
  * by this process's own keypair via `contract.Client`), market deployment
@@ -417,12 +438,7 @@ export class StellarService {
       '--initial_liquidity',
       params.initialLiquidityStroops.toString(),
       '--reflector',
-      JSON.stringify({
-        contract: params.reflectorContract,
-        asset: params.reflectorAsset,
-        max_staleness_secs: params.reflectorMaxStalenessSecs.toString(),
-        tolerance_bps: params.reflectorToleranceBps,
-      }),
+      buildReflectorConfigArg(params),
     ];
 
     try {

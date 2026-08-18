@@ -485,7 +485,7 @@ retries exhaust for a short-grace test market).
 cp .env.example .env   # fill in ORACLE_SECRET_KEY, ADMIN_API_KEY at minimum
 npm install
 npm run start:dev      # http://localhost:3001
-npm test                # 91 unit tests
+npm test                # 92 unit tests
 ```
 
 `ORACLE_SECRET_KEY` is the only hard requirement to boot — everything else
