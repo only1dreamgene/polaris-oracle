@@ -13,7 +13,7 @@ interface EmailCodeRow {
   created_at: number;
 }
 
-interface EmailWalletRow {
+export interface EmailWalletRow {
   email: string;
   address: string;
   public_key_hex: string;
@@ -88,6 +88,11 @@ export class EmailAuthRepository {
     return this.db.prepare('SELECT * FROM email_wallets WHERE email = ?').get(email) as
       | EmailWalletRow
       | undefined;
+  }
+
+  /** Every custodial email wallet this backend has ever created — the admin dashboard's Wallets view combines this with `wallet_actions`' passkey addresses (see AdminActivityRepository), since passkey wallets have no local registry of their own. */
+  getAllWallets(): EmailWalletRow[] {
+    return this.db.prepare('SELECT * FROM email_wallets ORDER BY created_at DESC').all() as EmailWalletRow[];
   }
 
   saveWallet(email: string, address: string, publicKeyHex: string, encryptedPrivateKey: string): void {

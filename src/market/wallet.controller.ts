@@ -1,9 +1,21 @@
-import { BadRequestException, Body, Controller, Get, HttpException, HttpStatus, Post, Query, Req } from '@nestjs/common';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Get,
+  HttpException,
+  HttpStatus,
+  Logger,
+  Post,
+  Query,
+  Req,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { Request } from 'express';
 import { StellarService } from './stellar.service';
 import { AuthRelayService } from './auth-relay.service';
 import { WalletDeployRateLimiter } from './wallet-deploy-rate-limiter.service';
+import { AdminActivityRepository, type WalletActionFunction } from './admin-activity.repository';
 import { DeployWalletDto } from './dto/deploy-wallet.dto';
 import { PrepareAuthDto } from './dto/prepare-auth.dto';
 import { SubmitAuthDto } from './dto/submit-auth.dto';
@@ -15,11 +27,14 @@ import { SubmitAuthDto } from './dto/submit-auth.dto';
  */
 @Controller('wallets')
 export class WalletController {
+  private readonly logger = new Logger(WalletController.name);
+
   constructor(
     private readonly stellar: StellarService,
     private readonly relay: AuthRelayService,
     private readonly config: ConfigService,
     private readonly deployRateLimiter: WalletDeployRateLimiter,
+    private readonly activity: AdminActivityRepository,
   ) {}
 
   /**
@@ -61,7 +76,7 @@ export class WalletController {
 
   @Post('tx/submit')
   async submit(@Body() dto: SubmitAuthDto) {
-    return this.relay.submit(
+    const result = await this.relay.submit(
       dto.contractId,
       dto.function,
       dto.args,
@@ -73,5 +88,26 @@ export class WalletController {
         signatureHex: dto.assertion.signatureHex,
       },
     );
+    // Best-effort admin-dashboard logging, after the on-chain result is
+    // already confirmed — never let this affect the real response. See
+    // AdminActivityRepository's doc comment: a read-side cache, not a
+    // second source of truth, so a failure here is just a dropped
+    // dashboard row, not something worth failing the request over.
+    try {
+      const feeBps = ['buy', 'sell'].includes(dto.function) ? await this.stellar.getFee(dto.contractId) : undefined;
+      this.activity.recordWalletAction({
+        contractId: dto.contractId,
+        walletAddress: result.walletAddress,
+        functionName: dto.function as WalletActionFunction,
+        collateralAmount:
+          typeof dto.args.collateral_amount !== 'undefined' ? String(dto.args.collateral_amount) : undefined,
+        feeBps,
+        txHash: result.txHash,
+        source: 'passkey',
+      });
+    } catch (err) {
+      this.logger.warn(`failed to record admin-activity row for tx ${result.txHash}: ${(err as Error).message}`);
+    }
+    return { txHash: result.txHash };
   }
 }

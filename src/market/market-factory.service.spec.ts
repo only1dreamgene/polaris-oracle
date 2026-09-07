@@ -3,6 +3,7 @@ import { MarketFactoryService, type FeedCatalogEntry } from './market-factory.se
 import { MarketRepository } from './market.repository';
 import { MarketService } from './market.service';
 import { MarketEvents } from './market-events';
+import type { AdminActivityRepository } from './admin-activity.repository';
 import type { WatchedMarket } from './market.types';
 
 // Same "hand-rolled fakes, no real StellarService/network SDK" pattern as
@@ -26,6 +27,10 @@ function makeRepo(existing: WatchedMarket[] = []): MarketRepository {
 
 function makeMarkets(): MarketService {
   return { watch: jest.fn() } as unknown as MarketService;
+}
+
+function makeActivity(): AdminActivityRepository {
+  return { recordVaultFlow: jest.fn() } as unknown as AdminActivityRepository;
 }
 
 function makeConfig(overrides: Record<string, unknown> = {}): ConfigService {
@@ -92,7 +97,7 @@ describe('MarketFactoryService — run()', () => {
     const config = makeConfig();
     mockHermesFetch({ price: '10000000', expo: -8 });
 
-    const svc = new MarketFactoryService(repo, markets, stellar as any, config, new MarketEvents());
+    const svc = new MarketFactoryService(repo, markets, stellar as any, config, new MarketEvents(), makeActivity());
     const result = await svc.run();
 
     expect(result.skipped).toEqual(['XLM/USD']);
@@ -111,7 +116,7 @@ describe('MarketFactoryService — run()', () => {
     const config = makeConfig();
     mockHermesFetch({ price: '10000000', expo: -8 }); // 0.10 USD -> 10 cents
 
-    const svc = new MarketFactoryService(repo, markets, stellar as any, config, new MarketEvents());
+    const svc = new MarketFactoryService(repo, markets, stellar as any, config, new MarketEvents(), makeActivity());
     const result = await svc.run();
 
     expect(stellar.vaultWithdraw).toHaveBeenCalledWith('CVAULT', 1_000_000_000n);
@@ -142,7 +147,7 @@ describe('MarketFactoryService — run()', () => {
     const config = makeConfig();
     mockHermesFetch({ price: '10000000', expo: -8 });
 
-    const svc = new MarketFactoryService(repo, markets, stellar as any, config, new MarketEvents());
+    const svc = new MarketFactoryService(repo, markets, stellar as any, config, new MarketEvents(), makeActivity());
     const result = await svc.run();
 
     expect(stellar.deployMarket).not.toHaveBeenCalled();
@@ -170,7 +175,7 @@ describe('MarketFactoryService — run()', () => {
       } as unknown as Response;
     }) as unknown as typeof fetch;
 
-    const svc = new MarketFactoryService(repo, markets, stellar as any, config, new MarketEvents());
+    const svc = new MarketFactoryService(repo, markets, stellar as any, config, new MarketEvents(), makeActivity());
     const result = await svc.run();
 
     expect(result.failed).toEqual([{ symbol: 'XLM/USD', error: 'Hermes price lookup failed: 503' }]);
@@ -184,7 +189,7 @@ describe('MarketFactoryService — run()', () => {
     const config = makeConfig({ vaultContract: undefined });
     mockHermesFetch({ price: '10000000', expo: -8 });
 
-    const svc = new MarketFactoryService(repo, markets, stellar as any, config, new MarketEvents());
+    const svc = new MarketFactoryService(repo, markets, stellar as any, config, new MarketEvents(), makeActivity());
     const result = await svc.run();
 
     expect(result.failed).toHaveLength(1);
@@ -213,7 +218,7 @@ describe('MarketFactoryService — auto-rolling successors', () => {
     const events = new MarketEvents();
     mockHermesFetch({ price: '10000000', expo: -8 });
 
-    const svc = new MarketFactoryService(repo, markets, stellar as any, config, events);
+    const svc = new MarketFactoryService(repo, markets, stellar as any, config, events, makeActivity());
     svc.onModuleInit();
     await flushMicrotasks(); // let the boot-time run() settle — COLD is still watching, so it should skip
     expect(stellar.deployMarket).not.toHaveBeenCalled();
@@ -242,7 +247,7 @@ describe('MarketFactoryService — auto-rolling successors', () => {
     const events = new MarketEvents();
     mockHermesFetch({ price: '10000000', expo: -8 });
 
-    const svc = new MarketFactoryService(repo, markets, stellar as any, config, events);
+    const svc = new MarketFactoryService(repo, markets, stellar as any, config, events, makeActivity());
     svc.onModuleInit();
     await flushMicrotasks();
     stellar.deployMarket.mockClear();
@@ -264,7 +269,7 @@ describe('MarketFactoryService — auto-rolling successors', () => {
     const config = makeConfig();
     mockHermesFetch({ price: '10000000', expo: -8 });
 
-    const svc = new MarketFactoryService(repo, markets, stellar as any, config, new MarketEvents());
+    const svc = new MarketFactoryService(repo, markets, stellar as any, config, new MarketEvents(), makeActivity());
     // Both calls' synchronous prefix (hasOpenMarket + rolling.add) runs to
     // completion before either hits its first await (inside the Hermes
     // fetch) — JS run-to-completion semantics guarantee the second call

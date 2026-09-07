@@ -4,6 +4,7 @@ import { MarketController } from './market.controller';
 import { PriceController } from './price.controller';
 import { WalletController } from './wallet.controller';
 import { EmailAuthController } from './email-auth.controller';
+import { AdminController } from './admin.controller';
 import { MarketService } from './market.service';
 import { MarketFactoryService } from './market-factory.service';
 import { MarketEvents } from './market-events';
@@ -16,10 +17,11 @@ import { EmailAuthService } from './email-auth.service';
 import { AdminGuard } from './admin.guard';
 import { MarketRepository, MARKETS_DB_PATH } from './market.repository';
 import { EmailAuthRepository } from './email-auth.repository';
+import { AdminActivityRepository } from './admin-activity.repository';
 import { EMAIL_SENDER, ConsoleEmailSender, ResendEmailSender } from './email-sender';
 
 @Module({
-  controllers: [MarketController, PriceController, WalletController, EmailAuthController],
+  controllers: [MarketController, PriceController, WalletController, EmailAuthController, AdminController],
   providers: [
     MarketService,
     MarketFactoryService,
@@ -33,6 +35,7 @@ import { EMAIL_SENDER, ConsoleEmailSender, ResendEmailSender } from './email-sen
     AdminGuard,
     MarketRepository,
     EmailAuthRepository,
+    AdminActivityRepository,
     ConsoleEmailSender,
     ResendEmailSender,
     {

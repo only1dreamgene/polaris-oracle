@@ -132,7 +132,7 @@ export class AuthRelayService {
     entryXdr: string,
     validUntilLedgerSeq: number,
     assertion: WebAuthnAssertion,
-  ): Promise<{ txHash: string }> {
+  ): Promise<{ txHash: string; walletAddress: string }> {
     const unsignedEntry = xdr.SorobanAuthorizationEntry.fromXDR(entryXdr, 'base64');
 
     // Read the authorizing address back out of the entry itself rather than
@@ -182,7 +182,7 @@ export class AuthRelayService {
       throw new BadRequestException(`transaction ${sendRes.hash} did not succeed: ${finalRes.status}`);
     }
 
-    return { txHash: sendRes.hash };
+    return { txHash: sendRes.hash, walletAddress };
   }
 
   private async pollTransaction(txHash: string, attempts = 30, delayMs = 2000): Promise<rpc.Api.GetTransactionResponse> {

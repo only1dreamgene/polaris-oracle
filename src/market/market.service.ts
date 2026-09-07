@@ -4,6 +4,7 @@ import { StellarService } from './stellar.service';
 import { OracleService } from './oracle.service';
 import { MarketRepository } from './market.repository';
 import { MarketEvents } from './market-events';
+import { AdminActivityRepository } from './admin-activity.repository';
 import { fetchHermesPriceCents } from './pyth-price';
 import type { WatchedMarket } from './market.types';
 import type { FeedCatalogEntry } from './market-factory.service';
@@ -65,6 +66,7 @@ export class MarketService implements OnModuleInit {
     private readonly oracle: OracleService,
     private readonly config: ConfigService,
     private readonly events: MarketEvents,
+    private readonly activity: AdminActivityRepository,
   ) {}
 
   onModuleInit(): void {
@@ -210,18 +212,24 @@ export class MarketService implements OnModuleInit {
    * silently stall.
    */
   private async crossCheckAgainstHermes(m: WatchedMarket, lazerPriceCents: bigint | undefined): Promise<void> {
-    if (lazerPriceCents === undefined) return;
+    if (lazerPriceCents === undefined) {
+      this.recordCheck(m.contractId, { outcome: 'skipped', reason: 'no parsed Lazer price' });
+      return;
+    }
     const catalog = this.config.get<FeedCatalogEntry[]>('feedCatalog') ?? [];
     const entry = catalog.find((e) => e.feedId === m.feedId);
-    if (!entry) return;
+    if (!entry) {
+      this.recordCheck(m.contractId, { outcome: 'skipped', reason: 'feed not in catalog' });
+      return;
+    }
 
     let hermesPriceCents: bigint;
     try {
       hermesPriceCents = await fetchHermesPriceCents(this.config.get<string>('pythHermesUrl')!, entry.hermesFeedId);
     } catch (err) {
-      this.logger.warn(
-        `oracle cross-check skipped for ${m.contractId} (Hermes lookup failed): ${(err as Error).message}`,
-      );
+      const message = (err as Error).message;
+      this.logger.warn(`oracle cross-check skipped for ${m.contractId} (Hermes lookup failed): ${message}`);
+      this.recordCheck(m.contractId, { outcome: 'skipped', reason: `Hermes lookup failed: ${message}` });
       return;
     }
 
@@ -231,15 +239,49 @@ export class MarketService implements OnModuleInit {
     // by zero.
     const bps = hermesPriceCents === 0n ? 10_000n : (diff * 10_000n) / hermesPriceCents;
     const toleranceBps = BigInt(this.config.get<number>('settleOracleToleranceBps')!);
+    const divergenceBps = Number(bps);
 
     if (bps > toleranceBps) {
+      this.recordCheck(m.contractId, {
+        outcome: 'failed',
+        lazerPriceCents,
+        hermesPriceCents,
+        divergenceBps,
+        reason: `diverge ${bps}bps > tolerance ${toleranceBps}bps`,
+      });
       throw new Error(
         `oracle cross-check failed: Lazer ${lazerPriceCents}c vs Hermes ${hermesPriceCents}c diverge ${bps}bps > tolerance ${toleranceBps}bps`,
       );
     }
+    this.recordCheck(m.contractId, { outcome: 'ok', lazerPriceCents, hermesPriceCents, divergenceBps });
     this.logger.log(
       `oracle cross-check ok for ${m.contractId}: Lazer ${lazerPriceCents}c vs Hermes ${hermesPriceCents}c (${bps}bps)`,
     );
+  }
+
+  /** Best-effort admin-dashboard logging for the cross-check above — see AdminActivityRepository's doc comment: a read-side cache, never allowed to affect the actual settle path. */
+  private recordCheck(
+    marketContractId: string,
+    check: {
+      outcome: 'ok' | 'skipped' | 'failed';
+      lazerPriceCents?: bigint;
+      hermesPriceCents?: bigint;
+      divergenceBps?: number;
+      reason?: string;
+    },
+  ): void {
+    try {
+      this.activity.recordSettlementCheck({
+        marketContractId,
+        lazerPriceCents: check.lazerPriceCents,
+        hermesPriceCents: check.hermesPriceCents,
+        divergenceBps: check.divergenceBps,
+        outcome: check.outcome,
+        reason: check.reason,
+      });
+    } catch (err) {
+      this.logger.warn(`failed to record admin-activity settlement_check for ${marketContractId}: ${(err as Error).message}`);
+    }
   }
 
   /**

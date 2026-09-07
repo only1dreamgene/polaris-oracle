@@ -2,7 +2,12 @@ import { ConfigService } from '@nestjs/config';
 import { MarketService } from './market.service';
 import { MarketRepository } from './market.repository';
 import { MarketEvents } from './market-events';
+import type { AdminActivityRepository } from './admin-activity.repository';
 import type { WatchedMarket } from './market.types';
+
+function makeActivity(): AdminActivityRepository {
+  return { recordSettlementCheck: jest.fn() } as unknown as AdminActivityRepository;
+}
 
 // This suite is pure orchestration logic — it doesn't need the real
 // StellarService (which pulls in @stellar/stellar-sdk) or OracleService, so
@@ -58,7 +63,7 @@ describe('MarketService — settlement orchestration', () => {
       isAvailable: true,
       waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('payload'), priceCents: undefined }),
     };
-    const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents());
+    const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents(), makeActivity());
 
     const m = svc.watch(sample());
     // watch() arms synchronously via a microtask chain (now >= expiry, < grace end) — flush it.
@@ -76,7 +81,7 @@ describe('MarketService — settlement orchestration', () => {
       const repo = makeRepo();
       const stellar = { settle: jest.fn(), cancel: jest.fn().mockResolvedValue('CANCELTX') };
       const oracle = { isAvailable: false, waitForUpdate: jest.fn() };
-      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents());
+      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents(), makeActivity());
 
       const m = sample({ gracePeriodSecs: 60 });
       svc.watch(m);
@@ -105,7 +110,7 @@ describe('MarketService — settlement orchestration', () => {
         getMarketState: jest.fn().mockRejectedValue(new Error('rpc down too')),
       };
       const oracle = { isAvailable: true, waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('x'), priceCents: undefined }) };
-      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents());
+      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents(), makeActivity());
 
       const m = sample({ gracePeriodSecs: 60 });
       svc.watch(m);
@@ -144,7 +149,7 @@ describe('MarketService — settlement orchestration', () => {
         isAvailable: true,
         waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('x'), priceCents: undefined }),
       };
-      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents());
+      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents(), makeActivity());
 
       const m = sample({ gracePeriodSecs: 3600 }); // long grace — retries must land well inside it
       svc.watch(m);
@@ -171,7 +176,7 @@ describe('MarketService — settlement orchestration', () => {
       getMarketState: jest.fn().mockResolvedValue({ status: 'ResolvedYes' }),
     };
     const oracle = { isAvailable: true, waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('x'), priceCents: undefined }) };
-    const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents());
+    const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents(), makeActivity());
 
     const m = sample({ gracePeriodSecs: 60 });
     svc.watch(m);
@@ -190,7 +195,7 @@ describe('MarketService — settlement orchestration', () => {
       getMarketState: jest.fn().mockResolvedValue({ status: 'Cancelled' }),
     };
     const oracle = { isAvailable: true, waitForUpdate: jest.fn() };
-    const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents());
+    const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents(), makeActivity());
 
     const m = sample({ status: 'pending' });
     repo.upsert(m);
@@ -219,7 +224,7 @@ describe('MarketService — settlement orchestration', () => {
           .mockResolvedValueOnce({ status: 'Cancelled' }),
       };
       const oracle = { isAvailable: true, waitForUpdate: jest.fn() };
-      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents());
+      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents(), makeActivity());
 
       const m = sample({ status: 'pending' });
       repo.upsert(m);
@@ -248,7 +253,7 @@ describe('MarketService — settlement orchestration', () => {
         getMarketState: jest.fn().mockRejectedValue(new Error('rpc down')),
       };
       const oracle = { isAvailable: true, waitForUpdate: jest.fn() };
-      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents());
+      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents(), makeActivity());
 
       const m = sample({ status: 'pending' });
       repo.upsert(m);
@@ -269,7 +274,7 @@ describe('MarketService — settlement orchestration', () => {
     const repo = makeRepo();
     const stellar = { settle: jest.fn(), cancel: jest.fn() };
     const oracle = { isAvailable: true, waitForUpdate: jest.fn() };
-    const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents());
+    const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents(), makeActivity());
 
     const m = sample({ status: 'settled' });
     repo.upsert(m);
@@ -285,7 +290,7 @@ describe('MarketService — settlement orchestration', () => {
     const repo = makeRepo();
     const stellar = { settle: jest.fn().mockResolvedValue('RETRYTX'), cancel: jest.fn() };
     const oracle = { isAvailable: true, waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('x'), priceCents: undefined }) };
-    const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents());
+    const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents(), makeActivity());
 
     const m = sample({ status: 'pending', lastError: 'previous failure' });
     repo.upsert(m);
@@ -310,7 +315,7 @@ describe('MarketService — settlement orchestration', () => {
       });
       repo.upsert(future);
 
-      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents());
+      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents(), makeActivity());
       svc.onModuleInit();
 
       // Re-arming a future-expiry market should not immediately settle/cancel it.
@@ -358,7 +363,7 @@ describe('MarketService — oracle cross-check', () => {
       waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('x'), priceCents: 10n }),
     };
     mockHermesFetch({ price: '10000000', expo: -8 });
-    const svc = new MarketService(repo, stellar as any, oracle as any, makeConfig(), new MarketEvents());
+    const svc = new MarketService(repo, stellar as any, oracle as any, makeConfig(), new MarketEvents(), makeActivity());
 
     const m = svc.watch(sample());
     await flushMicrotasks();
@@ -382,7 +387,7 @@ describe('MarketService — oracle cross-check', () => {
         waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('x'), priceCents: 10n }),
       };
       mockHermesFetch({ price: '20000000', expo: -8 });
-      const svc = new MarketService(repo, stellar as any, oracle as any, makeConfig(), new MarketEvents());
+      const svc = new MarketService(repo, stellar as any, oracle as any, makeConfig(), new MarketEvents(), makeActivity());
 
       const m = sample({ gracePeriodSecs: 60 });
       svc.watch(m);
@@ -417,6 +422,7 @@ describe('MarketService — oracle cross-check', () => {
       oracle as any,
       makeConfig({ feedCatalog: [] }),
       new MarketEvents(),
+      makeActivity(),
     );
 
     const m = svc.watch(sample());
@@ -435,7 +441,7 @@ describe('MarketService — oracle cross-check', () => {
       waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('x'), priceCents: 10n }),
     };
     mockHermesFetch('error');
-    const svc = new MarketService(repo, stellar as any, oracle as any, makeConfig(), new MarketEvents());
+    const svc = new MarketService(repo, stellar as any, oracle as any, makeConfig(), new MarketEvents(), makeActivity());
 
     const m = svc.watch(sample());
     await flushMicrotasks();
@@ -454,7 +460,7 @@ describe('MarketService — oracle cross-check', () => {
     };
     const fetchSpy = jest.fn();
     global.fetch = fetchSpy as unknown as typeof fetch;
-    const svc = new MarketService(repo, stellar as any, oracle as any, makeConfig(), new MarketEvents());
+    const svc = new MarketService(repo, stellar as any, oracle as any, makeConfig(), new MarketEvents(), makeActivity());
 
     const m = svc.watch(sample());
     await flushMicrotasks();

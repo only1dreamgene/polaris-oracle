@@ -154,6 +154,22 @@ export class StellarService {
     return this.deployerKeypair.publicKey();
   }
 
+  /** New — `rpc.Server.getHealth()` is never called anywhere else in this codebase. Powers the admin dashboard's Blockchain/network-health view. `GetHealthResponse` already carries `latestLedger`, so one RPC round trip is enough — no separate `getLatestLedger()` call needed. */
+  async getNetworkHealth(): Promise<{
+    status: string;
+    latestLedger: number;
+    oldestLedger: number;
+    ledgerRetentionWindow: number;
+  }> {
+    const health = await this.server.getHealth();
+    return {
+      status: health.status,
+      latestLedger: health.latestLedger,
+      oldestLedger: health.oldestLedger,
+      ledgerRetentionWindow: health.ledgerRetentionWindow,
+    };
+  }
+
   private marketClient(contractId: string) {
     return new StellarContract.Client(marketSpec, {
       contractId,
@@ -334,6 +350,13 @@ export class StellarService {
   async vaultBalance(vaultContractId: string): Promise<bigint> {
     const client = this.vaultClient(vaultContractId);
     const tx = await this.withRpcRetry(() => (client as any).get_balance());
+    return (tx.result as { unwrap: () => bigint }).unwrap();
+  }
+
+  /** Lifetime deposits, in stroops — always `>= vaultBalance` (this v1 vault has no LP-share accounting yet, see the contract's own doc comment). Powers the admin dashboard's Treasury view. */
+  async vaultTotalDeposited(vaultContractId: string): Promise<bigint> {
+    const client = this.vaultClient(vaultContractId);
+    const tx = await this.withRpcRetry(() => (client as any).get_total_deposited());
     return (tx.result as { unwrap: () => bigint }).unwrap();
   }
 

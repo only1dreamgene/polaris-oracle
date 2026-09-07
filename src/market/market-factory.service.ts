@@ -4,6 +4,7 @@ import { MarketRepository } from './market.repository';
 import { MarketService } from './market.service';
 import { MarketEvents } from './market-events';
 import { StellarService } from './stellar.service';
+import { AdminActivityRepository } from './admin-activity.repository';
 import { fetchHermesPriceCents } from './pyth-price';
 import type { WatchedMarket } from './market.types';
 
@@ -48,6 +49,7 @@ export class MarketFactoryService implements OnModuleInit, OnModuleDestroy {
     private readonly stellar: StellarService,
     private readonly config: ConfigService,
     private readonly events: MarketEvents,
+    private readonly activity: AdminActivityRepository,
   ) {}
 
   onModuleInit(): void {
@@ -167,7 +169,7 @@ export class MarketFactoryService implements OnModuleInit, OnModuleDestroy {
     // mismatch, ...) throws here and this feed is skipped for this run —
     // deployMarket never runs, so there's no partially-funded market left
     // behind. See the module doc: every entry fails independently.
-    await this.stellar.vaultWithdraw(vaultContract, initialLiquidityStroops);
+    const withdrawTxHash = await this.stellar.vaultWithdraw(vaultContract, initialLiquidityStroops);
 
     const { contractId } = await this.stellar.deployMarket({
       strikePriceCents,
@@ -196,6 +198,21 @@ export class MarketFactoryService implements OnModuleInit, OnModuleDestroy {
       gracePeriodSecs,
       feedId: entry.feedId,
     });
+
+    // Best-effort admin-dashboard logging, once the market that withdrawal
+    // actually funded is known — see AdminActivityRepository's doc comment:
+    // a read-side cache, a dropped row here is not worth failing a
+    // successful factory run over.
+    try {
+      this.activity.recordVaultFlow({
+        vaultContractId: vaultContract,
+        amountStroops: initialLiquidityStroops.toString(),
+        marketContractId: contractId,
+        txHash: withdrawTxHash,
+      });
+    } catch (err) {
+      this.logger.warn(`failed to record admin-activity vault_flow for ${contractId}: ${(err as Error).message}`);
+    }
 
     this.logger.log(`factory created market ${contractId} for ${entry.symbol} (strike ${strikePriceCents}c)`);
     return { contractId, strikePriceCents };

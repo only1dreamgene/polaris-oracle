@@ -4,6 +4,7 @@ import {
   Controller,
   Get,
   HttpCode,
+  Logger,
   Post,
   Req,
   Res,
@@ -12,6 +13,8 @@ import {
 import { ConfigService } from '@nestjs/config';
 import type { Request, Response } from 'express';
 import { EmailAuthService } from './email-auth.service';
+import { StellarService } from './stellar.service';
+import { AdminActivityRepository, type WalletActionFunction } from './admin-activity.repository';
 import { RequestEmailCodeDto } from './dto/request-email-code.dto';
 import { VerifyEmailCodeDto } from './dto/verify-email-code.dto';
 import { EmailTradeDto } from './dto/email-trade.dto';
@@ -30,9 +33,13 @@ const SESSION_COOKIE = 'polaris_session';
  */
 @Controller('auth/email')
 export class EmailAuthController {
+  private readonly logger = new Logger(EmailAuthController.name);
+
   constructor(
     private readonly emailAuth: EmailAuthService,
     private readonly config: ConfigService,
+    private readonly stellar: StellarService,
+    private readonly activity: AdminActivityRepository,
   ) {}
 
   @Post('request')
@@ -81,11 +88,31 @@ export class EmailAuthController {
     if (!session) {
       throw new UnauthorizedException('not signed in');
     }
+    let result: { txHash: string; walletAddress: string };
     try {
-      return await this.emailAuth.signAndSubmitTrade(session.email, dto.contractId, dto.function, dto.args);
+      result = await this.emailAuth.signAndSubmitTrade(session.email, dto.contractId, dto.function, dto.args);
     } catch (err) {
       throw new BadRequestException(messageOf(err));
     }
+    // Best-effort admin-dashboard logging — see wallet.controller.ts's
+    // `submit` handler for the identical pattern and why a failure here
+    // must never affect the real response.
+    try {
+      const feeBps = ['buy', 'sell'].includes(dto.function) ? await this.stellar.getFee(dto.contractId) : undefined;
+      this.activity.recordWalletAction({
+        contractId: dto.contractId,
+        walletAddress: result.walletAddress,
+        functionName: dto.function as WalletActionFunction,
+        collateralAmount:
+          typeof dto.args.collateral_amount !== 'undefined' ? String(dto.args.collateral_amount) : undefined,
+        feeBps,
+        txHash: result.txHash,
+        source: 'email',
+      });
+    } catch (err) {
+      this.logger.warn(`failed to record admin-activity row for tx ${result.txHash}: ${(err as Error).message}`);
+    }
+    return { txHash: result.txHash };
   }
 
   private cookieOptions() {
