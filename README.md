@@ -1,11 +1,13 @@
 # polaris-oracle
 
+[![CI](https://github.com/samuel2926i39-art/polaris-oracle/actions/workflows/ci.yml/badge.svg)](https://github.com/samuel2926i39-art/polaris-oracle/actions/workflows/ci.yml)
+
 NestJS settlement automation for **Polaris**. Watches deployed markets,
 relays Pyth Lazer prices at expiry, calls `settle`/`cancel`, and exposes a
 public read API, an admin API, a testnet faucet, and the passkey
 smart-wallet deploy + sponsored-transaction relay.
 
-See `../polaris-contracts/README.md` for the on-chain half of this system.
+See [`polaris-contracts`](https://github.com/samuel2926i39-art/polaris-contracts) for the on-chain half of this system, and [`polaris-frontend`](https://github.com/samuel2926i39-art/polaris-frontend) for the web app.
 
 ## Layout
 
@@ -300,7 +302,7 @@ no open/pending tracked market:
    floor bias would skew every fresh coin-flip market toward one side).
 2. Withdraws `MARKET_FACTORY_INITIAL_LIQUIDITY_STROOPS` from the
    capital-efficiency vault (`StellarService.vaultWithdraw` — see
-   `../polaris-contracts/README.md`'s vault section) *before* attempting to
+   [`polaris-contracts`](https://github.com/samuel2926i39-art/polaris-contracts)'s vault section) *before* attempting to
    deploy, so a withdrawal failure (vault underfunded, misconfigured) fails
    that feed loudly and skips it — never a market deployed without the
    capital to back it.
