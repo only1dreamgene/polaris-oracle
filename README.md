@@ -19,8 +19,10 @@ See `../polaris-contracts/README.md` for the on-chain half of this system.
 | `market-events.ts` | A trivial injectable `MarketEvents extends EventEmitter` — decouples `MarketService` (emits `'finalized'`) from `MarketFactoryService` (listens) without a circular Nest DI dependency. See "Auto-rolling successor markets". |
 | `pyth-price.ts` | Shared Hermes-price fetch/conversion, used by both the factory (a fresh market's strike price) and `MarketService`'s settlement cross-check (see "Multi-oracle settlement cross-check"). |
 | `market.repository.ts` | WAL-journaled SQLite persistence via `better-sqlite3`. |
-| `admin.guard.ts` | `x-admin-key` check, constant-time compare, fails closed if unset. |
+| `admin.guard.ts` | `x-admin-key` check, constant-time compare, fails closed if unset — throws `UnauthorizedException` (401), not a bare `false` (which Nest turns into a 403), so the admin dashboard's key-entry gate can tell "wrong key" apart from "forbidden regardless." |
+| `admin.controller.ts` / `admin-activity.repository.ts` | The admin dashboard's read API and its backing activity log. See "Admin dashboard" below. |
 | `faucet.service.ts` | Rate-limited (3/hour/address) Friendbot funding. |
+| `wallet-deploy-rate-limiter.service.ts` | Same rate-limiting shape as `FaucetService`, keyed by IP instead of address — mitigates (doesn't close) `POST /wallets/deploy`'s unauthenticated-by-design abuse surface. |
 | `contracts.ts` | Loads `wasm/*.wasm` and parses each contract's real spec via `contract.Spec.fromWasm` — argument/return encoding for custom types (the `Prediction` enum, the `Market`/`Signature` structs) comes from the compiled contract, not from guessing the wire format. |
 | `wire-args.ts` | Converts JSON-transportable request args into `xdr.ScVal[]`, and — the part that actually matters — injects the wallet's own address into whichever parameter authorizes each sponsored call. See "Bugs found by pressure-testing" below. |
 
@@ -479,13 +481,41 @@ now too transient to assert cleanly with fake timers once retries are
 involved, since the cancel fallback's own delay clamps to ~0 by the time
 retries exhaust for a short-grace test market).
 
+## Admin dashboard
+
+`polaris-frontend`'s `/admin/*` dashboard (grouped sidebar: Overview,
+Markets, Fee Revenue, Treasury, Wallets, Blockchain, Fraud & Trust) is
+backed entirely by `admin.controller.ts`, all `AdminGuard`-gated and
+read-only — the market-lifecycle admin actions (create, settle, cancel, run
+the factory) stay on `MarketController`, which already owned them.
+
+The load-bearing design decision: **no indexer needed for
+trade/wallet/fee visibility**. Every trade already flows through this
+backend at submission time (`AuthRelayService.submit()` for passkey,
+`EmailAuthService.signAndSubmitTrade()` for custodial) and both already
+poll to on-chain confirmation before returning — so `AdminActivityRepository`
+just records a row at that point, plus at `MarketFactoryService`'s vault
+withdrawal and at all 5 branches of the settlement cross-check. Every write
+is best-effort (wrapped in try/catch, logged on failure) — a dropped
+dashboard row is never allowed to affect the real trade/settle/factory path,
+since `MarketRepository`, the vault, and the contracts stay the actual
+source of truth; this table is a read-side cache, not a second one.
+
+Two honest limits, not discovered later: **forward-looking only** (nothing
+before this shipped appears — no retroactive indexing was built), and
+**fee revenue is captured live via `getFee()` at write time, not derived
+after the fact** — the contract's fee curve depends on the market's
+`total_supply` at the moment of the trade, which isn't recoverable once
+that trade has passed, so reconstructing it later from `collateral_amount`
+alone would be structurally wrong, not just approximate.
+
 ## Running
 
 ```sh
 cp .env.example .env   # fill in ORACLE_SECRET_KEY, ADMIN_API_KEY at minimum
 npm install
 npm run start:dev      # http://localhost:3001
-npm test                # 92 unit tests
+npm test                # 102 unit tests
 ```
 
 `ORACLE_SECRET_KEY` is the only hard requirement to boot — everything else
@@ -495,14 +525,14 @@ permissionless `cancel` at grace expiry instead of settling; no admin key
 
 ## Known gaps
 
-- `POST /wallets/deploy` is unauthenticated and unrated-limited by design
-  (self-service onboarding for a fresh passkey, which by definition has no
-  address yet to key a limiter on) — an attacker could still spam-deploy
-  wallets to drain this process's fee-paying balance. A production
-  deployment needs a real anti-abuse layer here (CAPTCHA, IP throttling, or
-  requiring proof of an existing funded account); deliberately out of scope
-  for this build, same spirit as the contracts repo's own "deliberately out
-  of scope" list.
+- `POST /wallets/deploy` is still unauthenticated by design (self-service
+  onboarding for a fresh passkey, which by definition has no address yet
+  to key a limiter on) — but is now rate-limited per IP
+  (`WalletDeployRateLimiter`, `WALLET_DEPLOY_MAX_PER_HOUR`, default 5),
+  mitigating rather than closing the abuse surface: an attacker rotating
+  IPs still works around it. A production deployment would still want a
+  stronger anti-abuse layer (CAPTCHA, requiring proof of an existing funded
+  account).
 - No test framework verification of the auth-relay's live submission path
   (see above) — the parts that don't need a network (ScVal construction,
   request validation) are covered; the RPC round-trip isn't.
