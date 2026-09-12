@@ -10,6 +10,7 @@ import { EMAIL_SENDER, type EmailSender } from './email-sender';
 import { encryptAtRest, decryptAtRest } from './email-crypto';
 import { generateP256Keypair, signChallengeWithEmailWallet } from './email-wallet-signer';
 import type { WireArgs } from './wire-args';
+import type { ContractKind } from './dto/prepare-auth.dto';
 
 export class EmailAuthError extends Error {}
 
@@ -110,6 +111,7 @@ export class EmailAuthService {
     contractId: string,
     functionName: string,
     args: WireArgs,
+    contractKind?: ContractKind,
   ): Promise<{ txHash: string; walletAddress: string }> {
     const walletRow = this.repo.getWallet(email);
     if (!walletRow) {
@@ -117,14 +119,22 @@ export class EmailAuthService {
     }
     const privateKey = decryptAtRest(walletRow.encrypted_private_key, this.config.get<string>('emailWalletEncKeyHex')!);
 
-    const prepared = await this.relay.prepare(walletRow.address, contractId, functionName, args);
+    const prepared = await this.relay.prepare(walletRow.address, contractId, functionName, args, contractKind);
     const assertion = signChallengeWithEmailWallet(
       privateKey,
       Buffer.from(prepared.signaturePayloadHex, 'hex'),
       this.config.get<string>('emailWalletRpId')!,
       this.config.get<string>('emailWalletOrigin')!,
     );
-    return this.relay.submit(contractId, functionName, args, prepared.entryXdr, prepared.validUntilLedgerSeq, assertion);
+    return this.relay.submit(
+      contractId,
+      functionName,
+      args,
+      prepared.entryXdr,
+      prepared.validUntilLedgerSeq,
+      assertion,
+      contractKind,
+    );
   }
 
   private async getOrCreateWallet(email: string): Promise<string> {

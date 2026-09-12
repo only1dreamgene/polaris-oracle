@@ -5,8 +5,8 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { MARKETS_DB_PATH } from './market.repository';
 
-export type WalletActionFunction = 'buy' | 'sell' | 'split' | 'merge' | 'redeem' | 'transfer';
-export type WalletActionSource = 'passkey' | 'email';
+export type WalletActionFunction = 'buy' | 'sell' | 'split' | 'merge' | 'redeem' | 'transfer' | 'terminate';
+export type WalletActionSource = 'passkey' | 'email' | 'admin';
 export type SettlementCheckOutcome = 'ok' | 'skipped' | 'failed';
 
 export interface WalletActionRow {

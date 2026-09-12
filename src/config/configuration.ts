@@ -12,6 +12,8 @@ export interface AppConfig {
   stellarNetworkPassphrase: string;
   stellarNetwork: string;
   marketWasmHash: string | undefined;
+  /** `contracts/perpetual` — see `polaris-contracts/README.md`'s "The perpetual contract". */
+  perpetualWasmHash: string | undefined;
   lazerContract: string | undefined;
   nativeXlmSac: string | undefined;
   smartWalletFactoryContract: string | undefined;
@@ -170,6 +172,7 @@ export default (): AppConfig => ({
     process.env.STELLAR_NETWORK_PASSPHRASE ?? 'Test SDF Network ; September 2015',
   stellarNetwork: process.env.STELLAR_NETWORK ?? 'testnet',
   marketWasmHash: process.env.MARKET_WASM_HASH,
+  perpetualWasmHash: process.env.PERPETUAL_WASM_HASH,
   lazerContract: process.env.LAZER_CONTRACT,
   nativeXlmSac: process.env.NATIVE_XLM_SAC,
   smartWalletFactoryContract: process.env.SMART_WALLET_FACTORY_CONTRACT,

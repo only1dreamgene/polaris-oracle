@@ -13,8 +13,18 @@ import {
   rpc,
   xdr,
 } from '@stellar/stellar-sdk';
-import { marketSpec } from './contracts';
+import type { contract } from '@stellar/stellar-sdk';
+import { marketSpec, perpetualSpec } from './contracts';
 import { buildSponsoredCallArgs, type WireArgs } from './wire-args';
+import type { ContractKind } from './dto/prepare-auth.dto';
+
+/** `polaris-market`/`polaris-perpetual` share every sponsorable function's
+ * name and shape (see `polaris-contracts/README.md`'s "The perpetual
+ * contract") — the only thing that differs per contract kind is which
+ * compiled spec `buildSponsoredCallArgs` encodes `wireArgs` against. */
+function specFor(kind: ContractKind | undefined): contract.Spec {
+  return kind === 'perpetual' ? perpetualSpec : marketSpec;
+}
 
 export interface PrepareAuthResult {
   entryXdr: string;
@@ -80,8 +90,9 @@ export class AuthRelayService {
     contractId: string,
     functionName: string,
     wireArgs: WireArgs,
+    contractKind?: ContractKind,
   ): Promise<PrepareAuthResult> {
-    const scArgs = buildSponsoredCallArgs(marketSpec, functionName, walletAddress, wireArgs);
+    const scArgs = buildSponsoredCallArgs(specFor(contractKind), functionName, walletAddress, wireArgs);
     const op = new Contract(contractId).call(functionName, ...scArgs);
 
     const sourceAccount = await this.server.getAccount(this.keypair.publicKey());
@@ -132,6 +143,7 @@ export class AuthRelayService {
     entryXdr: string,
     validUntilLedgerSeq: number,
     assertion: WebAuthnAssertion,
+    contractKind?: ContractKind,
   ): Promise<{ txHash: string; walletAddress: string }> {
     const unsignedEntry = xdr.SorobanAuthorizationEntry.fromXDR(entryXdr, 'base64');
 
@@ -152,7 +164,7 @@ export class AuthRelayService {
       this.networkPassphrase,
     );
 
-    const scArgs = buildSponsoredCallArgs(marketSpec, functionName, walletAddress, wireArgs);
+    const scArgs = buildSponsoredCallArgs(specFor(contractKind), functionName, walletAddress, wireArgs);
     const op = new Contract(contractId).call(functionName, ...scArgs);
     op.body().invokeHostFunctionOp().auth([signedEntry]);
 

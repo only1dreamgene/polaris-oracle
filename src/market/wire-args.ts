@@ -34,6 +34,34 @@ export const AUTH_ADDRESS_PARAM: Record<string, string> = {
 export const SPONSORABLE_FUNCTIONS = Object.keys(AUTH_ADDRESS_PARAM);
 
 /**
+ * Which wire-arg key holds the amount `apply_fee` charges its bps against,
+ * per function — `buy`'s fee is on the collateral going in
+ * (`collateral_amount`), `sell`'s is on the shares going in (`shares_in`),
+ * matching the contract's own `effective_in = apply_fee(...)` call in each
+ * (see `polaris-ctf-math::apply_fee`). Only `buy`/`sell` ever charge a fee
+ * at all (`split`/`merge`/`redeem`/`transfer` never call `apply_fee`), so
+ * this is deliberately not defined for those.
+ *
+ * Found live: `wallet.controller.ts`/`email-auth.controller.ts` only ever
+ * checked `collateral_amount`, so every `sell`'s fee-revenue row was
+ * silently recorded with no `collateral_amount` (`AdminController.
+ * feeRevenue()` skips rows where it's `null`) — sell fees were never
+ * counted, for every market and perpetual, since this dashboard shipped.
+ */
+const FEE_BEARING_AMOUNT_PARAM: Partial<Record<string, string>> = {
+  buy: 'collateral_amount',
+  sell: 'shares_in',
+};
+
+/** The fee-bearing amount from `args` for `functionName`, or `undefined` if that function never charges a fee (or the expected key is absent). */
+export function feeBearingAmount(functionName: string, args: WireArgs): string | undefined {
+  const key = FEE_BEARING_AMOUNT_PARAM[functionName];
+  if (!key) return undefined;
+  const value = args[key];
+  return typeof value === 'undefined' ? undefined : String(value);
+}
+
+/**
  * Builds the exact `xdr.ScVal[]` a sponsored call to `functionName` needs,
  * with `walletAddress` injected under whichever parameter actually
  * authorizes the call (see `AUTH_ADDRESS_PARAM`) — the single choke point

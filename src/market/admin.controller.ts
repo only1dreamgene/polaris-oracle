@@ -2,6 +2,7 @@ import { Controller, Get, Query, UseGuards } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { AdminGuard } from './admin.guard';
 import { MarketRepository } from './market.repository';
+import { PerpetualRepository } from './perpetual.repository';
 import { EmailAuthRepository } from './email-auth.repository';
 import { AdminActivityRepository } from './admin-activity.repository';
 import { StellarService } from './stellar.service';
@@ -24,6 +25,7 @@ export class AdminController {
   constructor(
     private readonly config: ConfigService,
     private readonly markets: MarketRepository,
+    private readonly perpetuals: PerpetualRepository,
     private readonly emailWallets: EmailAuthRepository,
     private readonly activity: AdminActivityRepository,
     private readonly stellar: StellarService,
@@ -40,9 +42,26 @@ export class AdminController {
     const vaultContract = this.config.get<string>('vaultContract');
     const vaultBalanceStroops = vaultContract ? (await this.stellar.vaultBalance(vaultContract)).toString() : null;
 
+    // Kept separate from `marketsByStatus` rather than merged into one
+    // grouping — a perpetual's `WatchedPerpetualStatus` ('watching' |
+    // 'terminated') isn't the same status space as a classic market's
+    // ('watching' | 'settling' | 'settled' | 'cancelling' | 'cancelled' |
+    // 'pending'), so combining them would either collide 'watching'
+    // across two different meanings or need namespacing either way — a
+    // separate top-level field is the honest shape, matching this round's
+    // "perpetuals get their own section" decision throughout the frontend
+    // too.
+    const allPerpetuals = this.perpetuals.getAll();
+    const perpetualsByStatus: Record<string, number> = {};
+    for (const p of allPerpetuals) {
+      perpetualsByStatus[p.status] = (perpetualsByStatus[p.status] ?? 0) + 1;
+    }
+
     return {
       totalMarkets: allMarkets.length,
       marketsByStatus,
+      totalPerpetuals: allPerpetuals.length,
+      perpetualsByStatus,
       vaultBalanceStroops,
       totalWalletActions: this.activity.countWalletActions(),
       settlementChecksByOutcome: this.activity.countSettlementChecksByOutcome(),
@@ -139,6 +158,7 @@ export class AdminController {
       },
       wasmHashes: {
         market: this.config.get<string>('marketWasmHash'),
+        perpetual: this.config.get<string>('perpetualWasmHash'),
         smartWallet: this.config.get<string>('smartWalletWasmHash'),
       },
     };

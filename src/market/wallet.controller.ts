@@ -16,6 +16,7 @@ import { StellarService } from './stellar.service';
 import { AuthRelayService } from './auth-relay.service';
 import { WalletDeployRateLimiter } from './wallet-deploy-rate-limiter.service';
 import { AdminActivityRepository, type WalletActionFunction } from './admin-activity.repository';
+import { feeBearingAmount } from './wire-args';
 import { DeployWalletDto } from './dto/deploy-wallet.dto';
 import { PrepareAuthDto } from './dto/prepare-auth.dto';
 import { SubmitAuthDto } from './dto/submit-auth.dto';
@@ -71,7 +72,7 @@ export class WalletController {
 
   @Post('tx/prepare')
   async prepare(@Body() dto: PrepareAuthDto) {
-    return this.relay.prepare(dto.walletAddress, dto.contractId, dto.function, dto.args);
+    return this.relay.prepare(dto.walletAddress, dto.contractId, dto.function, dto.args, dto.contractKind);
   }
 
   @Post('tx/submit')
@@ -87,6 +88,7 @@ export class WalletController {
         clientDataJsonBase64: dto.assertion.clientDataJsonBase64,
         signatureHex: dto.assertion.signatureHex,
       },
+      dto.contractKind,
     );
     // Best-effort admin-dashboard logging, after the on-chain result is
     // already confirmed — never let this affect the real response. See
@@ -94,13 +96,16 @@ export class WalletController {
     // second source of truth, so a failure here is just a dropped
     // dashboard row, not something worth failing the request over.
     try {
-      const feeBps = ['buy', 'sell'].includes(dto.function) ? await this.stellar.getFee(dto.contractId) : undefined;
+      const feeBps = ['buy', 'sell'].includes(dto.function)
+        ? await (dto.contractKind === 'perpetual'
+            ? this.stellar.getPerpetualFee(dto.contractId)
+            : this.stellar.getFee(dto.contractId))
+        : undefined;
       this.activity.recordWalletAction({
         contractId: dto.contractId,
         walletAddress: result.walletAddress,
         functionName: dto.function as WalletActionFunction,
-        collateralAmount:
-          typeof dto.args.collateral_amount !== 'undefined' ? String(dto.args.collateral_amount) : undefined,
+        collateralAmount: feeBearingAmount(dto.function, dto.args),
         feeBps,
         txHash: result.txHash,
         source: 'passkey',

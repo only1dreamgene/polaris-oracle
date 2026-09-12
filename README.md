@@ -21,6 +21,7 @@ See [`polaris-contracts`](https://github.com/samuel2926i39-art/polaris-contracts
 | `market-events.ts` | A trivial injectable `MarketEvents extends EventEmitter` — decouples `MarketService` (emits `'finalized'`) from `MarketFactoryService` (listens) without a circular Nest DI dependency. See "Auto-rolling successor markets". |
 | `pyth-price.ts` | Shared Hermes-price fetch/conversion, used by both the factory (a fresh market's strike price) and `MarketService`'s settlement cross-check (see "Multi-oracle settlement cross-check"). |
 | `market.repository.ts` | WAL-journaled SQLite persistence via `better-sqlite3`. |
+| `perpetual.service.ts` / `perpetual.controller.ts` / `perpetual.repository.ts` | The `polaris-perpetual` contract's much smaller counterpart to the three files above — no expiry, no settle, so none of `MarketService`'s timer/scheduling logic applies. See "Perpetual markets" below. |
 | `admin.guard.ts` | `x-admin-key` check, constant-time compare, fails closed if unset — throws `UnauthorizedException` (401), not a bare `false` (which Nest turns into a 403), so the admin dashboard's key-entry gate can tell "wrong key" apart from "forbidden regardless." |
 | `admin.controller.ts` / `admin-activity.repository.ts` | The admin dashboard's read API and its backing activity log. See "Admin dashboard" below. |
 | `faucet.service.ts` | Rate-limited (3/hour/address) Friendbot funding. |
@@ -30,7 +31,7 @@ See [`polaris-contracts`](https://github.com/samuel2926i39-art/polaris-contracts
 
 ## Bugs found by pressure-testing this system
 
-Ten real bugs surfaced by deliberately trying to break this system after
+Eleven real bugs surfaced by deliberately trying to break this system after
 it was "done," not just written once and left. Recorded here because each
 one is the kind of thing that looks fine in a code read and only shows up
 under adversarial pressure or a real failure:
@@ -237,6 +238,30 @@ clean pass — no `GracePeriodNotElapsed`, no `Account not found`, no retry
 warnings logged at all — where the same cycle had needed either a manual
 retry or produced a stuck `pending` status before.
 
+11. **Every `sell` has been silently missing from fee-revenue accounting
+    since the admin dashboard shipped.** `wallet.controller.ts`/
+    `email-auth.controller.ts` recorded each trade's fee-bearing amount by
+    reading `args.collateral_amount` unconditionally — the correct wire-arg
+    name for `buy`, but `sell`'s is `shares_in`. Every `sell`'s
+    `collateral_amount` was therefore recorded as `undefined`, which
+    `AdminController.feeRevenue()` treats as "skip this row" (it can't
+    compute a fee off a missing amount) — so `sell` fees were counted as
+    zero, for every market, silently, the whole time. Found live while
+    verifying the new perpetual-market wiring (below) end-to-end through
+    the real API: a `buy` then a `sell` against a fresh perpetual, and
+    `GET /admin/fee-revenue`'s total didn't move after the `sell` at all.
+    Fixed with a small `feeBearingAmount(functionName, args)` helper
+    (`wire-args.ts`) that knows each fee-charging function's actual
+    argument name (`buy` → `collateral_amount`, `sell` → `shares_in` —
+    matching each side's own `apply_fee(effective_in, ...)` call in the
+    contract); re-verified live afterward that a `sell` against the same
+    fresh perpetual now correctly moved the total.
+
+Worth knowing if you add a new sponsorable function that charges a fee:
+`feeBearingAmount`'s lookup table needs a new entry — it isn't derived
+from anything structural, so a function silently gets skipped rather than
+erroring if you forget (the same "quiet, not loud" failure shape as bug 1).
+
 Worth knowing if you add a new on-chain read: `contract.Spec` preserves the
 Rust struct's exact field names (snake_case) and represents enums as
 `{ tag: 'Open' }` rather than a bare string — it does **not** camelCase
@@ -388,6 +413,72 @@ repeated testing) was caught, logged with the real on-chain reason
 underfunded market — confirmed by topping the vault back up and re-running,
 which then succeeded cleanly.
 
+## Perpetual markets
+
+`polaris-perpetual` (see `polaris-contracts/README.md`'s "The perpetual
+contract") is a second, parallel contract kind — continuous trading, no
+strike price, no expiry, no `settle`. Deliberately wired as its **own**
+route family (`/perpetuals`, `PerpetualController`/`PerpetualService`/
+`PerpetualRepository`) rather than folded into the existing
+`/markets`/`MarketRepository` — a shared schema would mean a pile of
+columns meaningless for one contract kind or the other (`strike_price_cents`/
+`expiry`/`grace_period_secs`/`feed_id` don't exist on a perpetual; a
+perpetual's `last_price_cents`/`last_price_at` checkpoint fields don't
+exist on a classic market). The two share every trading mechanic
+(`buy`/`sell`/`split`/`merge`/`redeem`/`transfer`), so `PerpetualService`
+is a small fraction of `MarketService`'s size — no settle-timers, no
+cancel-fallback scheduling, no `onModuleInit` re-arming, since a perpetual
+has no expiry to arm any of that against. `terminate` is a pure
+admin-initiated action with no natural liveness deadline (see the
+contract's own doc comment — a stated v1 scope choice, not an oversight),
+so creating and terminating a perpetual are both one-shot admin actions,
+not automated the way `market-factory.service.ts` automates classic-market
+rollover.
+
+**Trading reuses the existing sponsored-relay path unchanged.**
+`buy`/`sell`/`split`/`merge`/`redeem`/`transfer` have identical names and
+argument shapes on both contracts, so `AuthRelayService.prepare`/`submit`
+and `EmailAuthService.signAndSubmitTrade` all gained one new optional
+parameter — `contractKind: 'market' | 'perpetual'` (default `'market'`,
+so every existing caller keeps working unchanged) — that picks which
+compiled `contract.Spec` to encode arguments against
+(`marketSpec`/`perpetualSpec` in `contracts.ts`). No new signing/relay
+logic at all; `wire-args.ts`'s `buildSponsoredCallArgs` was already
+spec-agnostic.
+
+**`price_oracle` is unconditionally `None` for every perpetual this
+backend deploys.** `record_price_checkpoint` (the contract's permissionless,
+zero-economic-effect price observation) is consequently not exposed as an
+endpoint here at all — wiring a real Lazer+Reflector[+RedStone] bundle
+into perpetual deployment is explicitly deferred (see
+`polaris-contracts/README.md`'s "A third oracle: RedStone", which is
+mainnet-only regardless, so this backend — testnet-only today — has
+nothing to point it at yet).
+
+**Admin dashboard**: `GET /admin/overview` reports `totalPerpetuals`/
+`perpetualsByStatus` as separate top-level fields, not merged into
+`marketsByStatus` — a perpetual's status space (`'watching' | 'terminated'`)
+isn't the same as a classic market's, so combining them would either
+collide `'watching'`'s two different meanings or need namespacing either
+way. `GET /admin/network`'s `wasmHashes` gained a `perpetual` entry
+alongside `market`. `terminate` is logged to the same `wallet_actions`
+table `buy`/`sell`/etc. use (a new `'terminate'` function kind, `'admin'`
+source — it's not wallet-sponsored, so `'passkey'`/`'email'` don't fit) —
+its 0.5-collateral-per-pair payout isn't a swap fee, so it's deliberately
+excluded from `feeRevenue()`'s `buy`/`sell`-only accounting rather than
+force-fit into it.
+
+**Live-verified end-to-end through the real API** (not direct CLI calls):
+`POST /perpetuals/create` deployed and initialized a real testnet
+contract; a `buy` then a `sell` through `POST /auth/email/trade` (with
+`contractKind: 'perpetual'`) round-tripped correctly (pool/position
+math confirmed via `GET /perpetuals/:id/state`/`position`); `POST
+/perpetuals/:id/terminate` wound it down; a final `redeem` paid out and
+drained the position to zero. `GET /admin/overview` and `/admin/fee-revenue`
+confirmed the dashboard picked up all of it correctly (`totalPerpetuals`,
+`perpetualsByStatus`, and a nonzero fee-revenue row for the trade) — which
+is also what caught bug 11 above.
+
 ## Off-chain multi-oracle settlement cross-check (Pyth-internal)
 
 "Redundant multi-oracle" here means a **Pyth-internal cross-check**
@@ -517,7 +608,7 @@ alone would be structurally wrong, not just approximate.
 cp .env.example .env   # fill in ORACLE_SECRET_KEY, ADMIN_API_KEY at minimum
 npm install
 npm run start:dev      # http://localhost:3001
-npm test                # 102 unit tests
+npm test                # 115 unit tests
 ```
 
 `ORACLE_SECRET_KEY` is the only hard requirement to boot — everything else
@@ -538,3 +629,8 @@ permissionless `cancel` at grace expiry instead of settling; no admin key
 - No test framework verification of the auth-relay's live submission path
   (see above) — the parts that don't need a network (ScVal construction,
   request validation) are covered; the RPC round-trip isn't.
+- Every perpetual this backend deploys has `price_oracle` unconditionally
+  `None` — `record_price_checkpoint` isn't exposed as an endpoint at all
+  yet (see "Perpetual markets" above). Wiring a real Lazer+Reflector
+  bundle in, and RedStone visibility in the admin dashboard generally, are
+  both deliberately deferred follow-ups, not implemented here.

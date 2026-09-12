@@ -15,6 +15,7 @@ import type { Request, Response } from 'express';
 import { EmailAuthService } from './email-auth.service';
 import { StellarService } from './stellar.service';
 import { AdminActivityRepository, type WalletActionFunction } from './admin-activity.repository';
+import { feeBearingAmount } from './wire-args';
 import { RequestEmailCodeDto } from './dto/request-email-code.dto';
 import { VerifyEmailCodeDto } from './dto/verify-email-code.dto';
 import { EmailTradeDto } from './dto/email-trade.dto';
@@ -90,7 +91,7 @@ export class EmailAuthController {
     }
     let result: { txHash: string; walletAddress: string };
     try {
-      result = await this.emailAuth.signAndSubmitTrade(session.email, dto.contractId, dto.function, dto.args);
+      result = await this.emailAuth.signAndSubmitTrade(session.email, dto.contractId, dto.function, dto.args, dto.contractKind);
     } catch (err) {
       throw new BadRequestException(messageOf(err));
     }
@@ -98,13 +99,16 @@ export class EmailAuthController {
     // `submit` handler for the identical pattern and why a failure here
     // must never affect the real response.
     try {
-      const feeBps = ['buy', 'sell'].includes(dto.function) ? await this.stellar.getFee(dto.contractId) : undefined;
+      const feeBps = ['buy', 'sell'].includes(dto.function)
+        ? await (dto.contractKind === 'perpetual'
+            ? this.stellar.getPerpetualFee(dto.contractId)
+            : this.stellar.getFee(dto.contractId))
+        : undefined;
       this.activity.recordWalletAction({
         contractId: dto.contractId,
         walletAddress: result.walletAddress,
         functionName: dto.function as WalletActionFunction,
-        collateralAmount:
-          typeof dto.args.collateral_amount !== 'undefined' ? String(dto.args.collateral_amount) : undefined,
+        collateralAmount: feeBearingAmount(dto.function, dto.args),
         feeBps,
         txHash: result.txHash,
         source: 'email',

@@ -1,6 +1,6 @@
 import { Keypair, scValToNative } from '@stellar/stellar-sdk';
 import { marketSpec } from './contracts';
-import { buildSponsoredCallArgs, coerceWireArgs, AUTH_ADDRESS_PARAM, SPONSORABLE_FUNCTIONS } from './wire-args';
+import { buildSponsoredCallArgs, coerceWireArgs, feeBearingAmount, AUTH_ADDRESS_PARAM, SPONSORABLE_FUNCTIONS } from './wire-args';
 
 /**
  * Regression coverage for a real bug: `AuthRelayService` originally built
@@ -85,5 +85,39 @@ describe('coerceWireArgs', () => {
     expect(args).not.toHaveProperty('user');
     expect(args).not.toHaveProperty('collateral_amount');
     expect(args).toHaveProperty('prediction');
+  });
+});
+
+/**
+ * Regression for another real bug, found live: `wallet.controller.ts`/
+ * `email-auth.controller.ts` only ever read `args.collateral_amount` when
+ * recording a trade's fee-revenue row, which is `buy`'s wire-arg name —
+ * `sell`'s is `shares_in`. Every `sell` therefore got its
+ * `collateral_amount` recorded as `undefined`, which
+ * `AdminController.feeRevenue()` treats as "skip this row," so no `sell`
+ * ever contributed to fee-revenue totals for any market or perpetual,
+ * silently, since this dashboard shipped. Confirmed live against a real
+ * perpetual market: buy contributed a nonzero fee-revenue row, sell did
+ * not, until this fix.
+ */
+describe('feeBearingAmount', () => {
+  it("reads buy's fee-bearing amount from collateral_amount", () => {
+    expect(feeBearingAmount('buy', { collateral_amount: '1000000', prediction: 'Yes' })).toBe('1000000');
+  });
+
+  it("reads sell's fee-bearing amount from shares_in, not collateral_amount", () => {
+    expect(feeBearingAmount('sell', { shares_in: '500000', prediction: 'Yes' })).toBe('500000');
+    expect(feeBearingAmount('sell', { collateral_amount: '999', shares_in: '500000' })).toBe('500000');
+  });
+
+  it('returns undefined for functions that never charge a fee', () => {
+    expect(feeBearingAmount('split', { amount: '1000' })).toBeUndefined();
+    expect(feeBearingAmount('merge', { amount: '1000' })).toBeUndefined();
+    expect(feeBearingAmount('redeem', {})).toBeUndefined();
+    expect(feeBearingAmount('transfer', { amount: '1000' })).toBeUndefined();
+  });
+
+  it('returns undefined when the expected key is absent, rather than throwing', () => {
+    expect(feeBearingAmount('sell', { prediction: 'Yes' })).toBeUndefined();
   });
 });

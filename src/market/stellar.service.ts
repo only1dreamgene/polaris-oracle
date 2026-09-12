@@ -4,8 +4,9 @@ import { Keypair, rpc } from '@stellar/stellar-sdk';
 import { contract as StellarContract } from '@stellar/stellar-sdk';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { marketSpec, factorySpec, vaultSpec } from './contracts';
+import { marketSpec, perpetualSpec, factorySpec, vaultSpec } from './contracts';
 import type { OnChainMarket } from './market.types';
+import type { OnChainPerpetual } from './perpetual.types';
 
 const execFileAsync = promisify(execFile);
 
@@ -69,22 +70,40 @@ export interface CreateMarketParams {
   reflectorToleranceBps: number;
 }
 
+export interface CreatePerpetualParams {
+  baseFeeBps: number;
+  minFeeBps: number;
+  treasury: string;
+  initialLiquidityStroops: bigint;
+  collateralAsset: string;
+}
+
 /**
  * The `--reflector` CLI arg for `deployMarket`'s `initialize` call — a
- * JSON-encoded `ReflectorConfig` struct. `max_staleness_secs` must be a
- * bare JSON number, not a quoted string, confirmed live: the CLI's
- * struct-arg parser rejected `"600"` with "unknown variant `600`". Safe to
- * convert the bigint directly here — this field is always a small
- * staleness window in seconds, nowhere near JS's safe-integer ceiling,
- * unlike the bigints passed as CLI *scalar* flags elsewhere in
- * `deployMarket`, which correctly stay strings.
+ * JSON-encoded `OracleFeedConfig` struct (renamed from `ReflectorConfig`
+ * once RedStone joined as a second corroborating leg using the same
+ * shape — see `polaris-contracts/README.md`'s "A third oracle: RedStone").
+ * `max_staleness_secs` must be a bare JSON number, not a quoted string,
+ * confirmed live: the CLI's struct-arg parser rejected `"600"` with
+ * "unknown variant `600`". Safe to convert the bigint directly here — this
+ * field is always a small staleness window in seconds, nowhere near JS's
+ * safe-integer ceiling, unlike the bigints passed as CLI *scalar* flags
+ * elsewhere in `deployMarket`, which correctly stay strings.
+ *
+ * `asset` is `{ Other: "XLM" }`, not the bare string `"XLM"` this used to
+ * be — `OracleFeedConfig.asset` became the `Asset` enum
+ * (`Stellar(Address) | Other(Symbol)`) once RedStone needed to key XLM
+ * under `Asset::Stellar(<SAC address>)` instead of Reflector's
+ * `Asset::Other("XLM")`. This build stays `Other`-only (Reflector is the
+ * only leg actually configured today), same "XLM-only" limitation as
+ * before, just expressed through the richer type.
  */
 export function buildReflectorConfigArg(
   params: Pick<CreateMarketParams, 'reflectorContract' | 'reflectorAsset' | 'reflectorMaxStalenessSecs' | 'reflectorToleranceBps'>,
 ): string {
   return JSON.stringify({
     contract: params.reflectorContract,
-    asset: params.reflectorAsset,
+    asset: { Other: params.reflectorAsset },
     max_staleness_secs: Number(params.reflectorMaxStalenessSecs),
     tolerance_bps: params.reflectorToleranceBps,
   });
@@ -182,6 +201,18 @@ export class StellarService {
     });
   }
 
+  private perpetualClient(contractId: string) {
+    return new StellarContract.Client(perpetualSpec, {
+      contractId,
+      networkPassphrase: this.networkPassphrase,
+      rpcUrl: this.rpcUrl,
+      allowHttp: this.rpcUrl.startsWith('http://'),
+      publicKey: this.keypair.publicKey(),
+      signTransaction: this.keypair as unknown as StellarContract.ClientOptions['signTransaction'],
+      server: this.server,
+    });
+  }
+
   private factoryClient(contractId: string) {
     return new StellarContract.Client(factorySpec, {
       contractId,
@@ -267,6 +298,56 @@ export class StellarService {
     const client = this.marketClient(contractId);
     const tx = await this.withRpcRetry(() => (client as any).get_fee());
     return tx.result.unwrap() as number;
+  }
+
+  // ---------- perpetual reads (simulated, no fee, no signature) ----------
+
+  async getPerpetualState(contractId: string): Promise<OnChainPerpetual> {
+    const client = this.perpetualClient(contractId);
+    const tx = await this.withRpcRetry(() => (client as any).get_market());
+    return normalizePerpetual(tx.result.unwrap() as RawOnChainPerpetual);
+  }
+
+  async getPerpetualPosition(contractId: string, address: string): Promise<[bigint, bigint]> {
+    const client = this.perpetualClient(contractId);
+    const tx = await this.withRpcRetry(() => (client as any).get_position({ addr: address }));
+    return tx.result as [bigint, bigint];
+  }
+
+  async getPerpetualPrice(contractId: string): Promise<{ yesBps: number; noBps: number }> {
+    const client = this.perpetualClient(contractId);
+    const tx = await this.withRpcRetry(() => (client as any).get_price());
+    const [yesBps, noBps] = tx.result.unwrap() as [number, number];
+    return { yesBps, noBps };
+  }
+
+  async getPerpetualFee(contractId: string): Promise<number> {
+    const client = this.perpetualClient(contractId);
+    const tx = await this.withRpcRetry(() => (client as any).get_fee());
+    return tx.result.unwrap() as number;
+  }
+
+  /**
+   * Admin-gated wind-down — see `polaris-contracts/README.md`'s "The
+   * perpetual contract" for why this needs no price/oracle at all, unlike
+   * `settle`. `initialize`'s `admin` is always `deployerPublicKey` (see
+   * `deployPerpetual`), so this signs with `deployerKeypair`, mirroring
+   * `deployMarket`'s own admin-identity split — matches on-chain
+   * `require_auth()` against whichever key actually holds that role.
+   */
+  async terminatePerpetual(contractId: string): Promise<string> {
+    const client = new StellarContract.Client(perpetualSpec, {
+      contractId,
+      networkPassphrase: this.networkPassphrase,
+      rpcUrl: this.rpcUrl,
+      allowHttp: this.rpcUrl.startsWith('http://'),
+      publicKey: this.deployerKeypair.publicKey(),
+      signTransaction: this.deployerKeypair as unknown as StellarContract.ClientOptions['signTransaction'],
+      server: this.server,
+    });
+    const tx = await this.withRpcRetry(() => (client as any).terminate({ admin: this.deployerKeypair.publicKey() }));
+    const sent = await tx.signAndSend();
+    return sent.sendTransactionResponse?.hash ?? sent.getTransactionResponse?.txHash ?? '';
   }
 
   // ---------- oracle-authorized writes ----------
@@ -462,6 +543,15 @@ export class StellarService {
       params.initialLiquidityStroops.toString(),
       '--reflector',
       buildReflectorConfigArg(params),
+      // `initialize`'s 13th param, `Option<OracleFeedConfig>` — RedStone
+      // has no testnet deployment (see polaris-contracts/README.md's "A
+      // third oracle: RedStone"), so this stays unconditionally `None`.
+      // `null` confirmed live as the CLI's encoding for an omitted
+      // optional struct arg (its own error message for a missing field
+      // elsewhere literally suggests this: "For optional values, use null
+      // for none or the expected value type").
+      '--redstone',
+      'null',
     ];
 
     try {
@@ -484,6 +574,86 @@ export class StellarService {
       if (!/Error\(Contract, #2\)/.test(message)) throw err; // #2 = AlreadyInitialized, see contracts/market's Error enum
       const state = await this.getMarketState(contractId);
       if (state.status !== 'Open') throw err; // genuinely uninitialized/broken — the AlreadyInitialized report was accurate, not a false negative
+      this.logger.warn(
+        `initialize on ${contractId} reported AlreadyInitialized but the contract is Open on-chain — treating as already succeeded, not a failure (no initTxHash available for this reconciled path)`,
+      );
+      return { contractId, initTxHash: '' };
+    }
+  }
+
+  /**
+   * Same deploy-then-initialize CLI shell-out as `deployMarket`, for
+   * `polaris-perpetual` — no strike/expiry/grace_period/feed_id (none
+   * exist on this contract), and `price_oracle` is unconditionally `None`:
+   * this backend doesn't wire a real Lazer+Reflector[+RedStone] bundle
+   * into perpetual deployment yet (that's a separate follow-up — see
+   * `polaris-contracts/README.md`'s "A third oracle: RedStone", which is
+   * mainnet-only regardless). `record_price_checkpoint` is consequently
+   * not exposed anywhere in this backend either — see `PerpetualController`.
+   */
+  async deployPerpetual(params: CreatePerpetualParams): Promise<{ contractId: string; initTxHash: string }> {
+    const network = this.config.get<string>('stellarNetwork')!;
+    const deploy = await this.execStellarCli([
+      'contract',
+      'deploy',
+      '--wasm',
+      'wasm/polaris_perpetual.wasm',
+      '--source',
+      this.deployerSecretKey,
+      '--network',
+      network,
+      '--rpc-url',
+      this.rpcUrl,
+      '--network-passphrase',
+      this.networkPassphrase,
+    ]);
+    const contractId = deploy.stdout.trim().split('\n').pop()!.trim();
+    this.logger.log(`deployed perpetual contract ${contractId}`);
+
+    await sleep(DEPLOY_TO_INIT_DELAY_MS);
+
+    const initArgs = [
+      'contract',
+      'invoke',
+      '--id',
+      contractId,
+      '--source',
+      this.deployerSecretKey,
+      '--network',
+      network,
+      '--rpc-url',
+      this.rpcUrl,
+      '--network-passphrase',
+      this.networkPassphrase,
+      '--',
+      'initialize',
+      '--admin',
+      this.deployerPublicKey,
+      '--collateral',
+      params.collateralAsset,
+      '--base_fee_bps',
+      params.baseFeeBps.toString(),
+      '--min_fee_bps',
+      params.minFeeBps.toString(),
+      '--treasury',
+      params.treasury,
+      '--initial_liquidity',
+      params.initialLiquidityStroops.toString(),
+      '--price_oracle',
+      'null',
+    ];
+
+    try {
+      const invoke = await this.execStellarCli(initArgs);
+      return { contractId, initTxHash: invoke.stdout.trim() };
+    } catch (err) {
+      // Same AlreadyInitialized reconciliation as `deployMarket` — see its
+      // own comment for the full "CLI can report failure on a call that
+      // actually succeeded on-chain" reasoning.
+      const message = (err as { stderr?: string; message: string }).stderr ?? (err as Error).message;
+      if (!/Error\(Contract, #2\)/.test(message)) throw err; // #2 = AlreadyInitialized, see contracts/perpetual's Error enum
+      const state = await this.getPerpetualState(contractId);
+      if (state.status !== 'Open') throw err;
       this.logger.warn(
         `initialize on ${contractId} reported AlreadyInitialized but the contract is Open on-chain — treating as already succeeded, not a failure (no initTxHash available for this reconciled path)`,
       );
@@ -538,6 +708,39 @@ interface RawOnChainMarket {
   pool_no: bigint;
   total_supply: bigint;
   initial_liquidity: bigint;
+}
+
+/** Raw `contract.Spec`-decoded `Perpetual` — see `RawOnChainMarket`'s doc comment for why this isn't assumed to line up with `OnChainPerpetual`'s field names/casing without an explicit translation. */
+interface RawOnChainPerpetual {
+  admin: string;
+  collateral: string;
+  base_fee_bps: number;
+  min_fee_bps: number;
+  treasury: string;
+  status: { tag: 'Open' | 'Terminated' };
+  pool_yes: bigint;
+  pool_no: bigint;
+  total_supply: bigint;
+  initial_liquidity: bigint;
+  last_price_cents: bigint;
+  last_price_at: bigint;
+}
+
+function normalizePerpetual(raw: RawOnChainPerpetual): OnChainPerpetual {
+  return {
+    admin: raw.admin,
+    collateral: raw.collateral,
+    baseFeeBps: raw.base_fee_bps,
+    minFeeBps: raw.min_fee_bps,
+    treasury: raw.treasury,
+    status: raw.status.tag,
+    poolYes: raw.pool_yes.toString(),
+    poolNo: raw.pool_no.toString(),
+    totalSupply: raw.total_supply.toString(),
+    initialLiquidity: raw.initial_liquidity.toString(),
+    lastPriceCents: raw.last_price_cents.toString(),
+    lastPriceAt: raw.last_price_at.toString(),
+  };
 }
 
 function normalizeMarket(raw: RawOnChainMarket): OnChainMarket {
