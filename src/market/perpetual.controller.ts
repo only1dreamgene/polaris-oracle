@@ -2,6 +2,7 @@ import { BadRequestException, Body, Controller, Get, HttpCode, Logger, NotFoundE
 import { ConfigService } from '@nestjs/config';
 import { PerpetualService } from './perpetual.service';
 import { StellarService } from './stellar.service';
+import { OracleService } from './oracle.service';
 import { AdminGuard } from './admin.guard';
 import { AdminActivityRepository } from './admin-activity.repository';
 import { CreatePerpetualDto } from './dto/create-perpetual.dto';
@@ -23,6 +24,7 @@ export class PerpetualController {
   constructor(
     private readonly perpetuals: PerpetualService,
     private readonly stellar: StellarService,
+    private readonly oracle: OracleService,
     private readonly config: ConfigService,
     private readonly activity: AdminActivityRepository,
   ) {}
@@ -76,10 +78,80 @@ export class PerpetualController {
       treasury,
       initialLiquidityStroops: BigInt(dto.initialLiquidityStroops),
       collateralAsset: nativeXlmSac,
+      priceOracle: this.buildPriceOracleParams(nativeXlmSac),
     });
 
     const watched = this.perpetuals.watch(contractId);
     return { ...watched, initTxHash };
+  }
+
+  /**
+   * `undefined` unless *every* piece needed for the full
+   * Lazer+Reflector+RedStone(mock) bundle is configured — see
+   * `configuration.ts`'s `mockRedstoneContract` doc comment for why this
+   * is all-or-nothing rather than a partial bundle.
+   */
+  private buildPriceOracleParams(nativeXlmSac: string) {
+    const lazerContract = this.config.get<string>('lazerContract');
+    const reflectorContract = this.config.get<string>('reflectorContract');
+    const mockRedstoneContract = this.config.get<string>('mockRedstoneContract');
+    if (!lazerContract || !reflectorContract || !mockRedstoneContract) return undefined;
+
+    return {
+      lazerContract,
+      feedId: this.config.get<number>('xlmUsdFeedId')!,
+      reflectorContract,
+      reflectorAsset: this.config.get<string>('reflectorAsset')!,
+      reflectorMaxStalenessSecs: BigInt(this.config.get<string>('reflectorMaxStalenessSecs')!),
+      reflectorToleranceBps: this.config.get<number>('reflectorToleranceBps')!,
+      redstoneContract: mockRedstoneContract,
+      nativeXlmSac,
+      redstoneMaxStalenessSecs: BigInt(this.config.get<string>('redstoneMaxStalenessSecs')!),
+      redstoneToleranceBps: this.config.get<number>('redstoneToleranceBps')!,
+    };
+  }
+
+  /**
+   * Admin-triggered, not scheduled — matches this contract's other
+   * lifecycle actions (`create`/`terminate`), both one-shot admin calls
+   * rather than an automated interval like `MarketFactoryService`'s.
+   * Refreshes `polaris-mock-redstone`'s price first (see
+   * `StellarService.refreshMockRedstonePrice`'s doc comment for why that's
+   * this caller's job, not the mock's), then calls
+   * `record_price_checkpoint` with a real signed Lazer payload — the
+   * *exact* same `OracleService.waitForUpdate` path `MarketService.trySettle`
+   * already uses. Unlike `trySettle`, there's no fallback action to take
+   * when the oracle is unavailable (checkpointing is purely
+   * informational — there's nothing to cancel toward), so this fails the
+   * request cleanly with a clear message instead of silently no-oping or
+   * (the bug this fixes, caught live) letting the rejection propagate
+   * uncaught into a bare 500.
+   */
+  @Post(':id/checkpoint')
+  @UseGuards(AdminGuard)
+  @HttpCode(200)
+  async checkpoint(@Param('id') id: string) {
+    const mockRedstoneContract = this.config.get<string>('mockRedstoneContract');
+    if (!mockRedstoneContract) {
+      throw new BadRequestException('MOCK_REDSTONE_CONTRACT must be configured to checkpoint a perpetual');
+    }
+    if (!this.oracle.isAvailable) {
+      throw new BadRequestException('Pyth Lazer is not available (PYTH_LAZER_TOKEN not configured?) — cannot checkpoint');
+    }
+    const feedId = this.config.get<number>('xlmUsdFeedId')!;
+    let payload: Buffer;
+    let priceCents: bigint | undefined;
+    try {
+      ({ payload, priceCents } = await this.oracle.waitForUpdate(feedId));
+    } catch (err) {
+      throw new BadRequestException(`Pyth Lazer update failed: ${(err as Error).message}`);
+    }
+    if (priceCents === undefined) {
+      throw new BadRequestException('Lazer update had no parsed price to refresh the mock RedStone leg with');
+    }
+    await this.stellar.refreshMockRedstonePrice(mockRedstoneContract, priceCents);
+    const txHash = await this.stellar.recordPriceCheckpoint(id, payload);
+    return { txHash, ...(await this.stellar.getPerpetualState(id)) };
   }
 
   @Post(':id/terminate')

@@ -4,7 +4,7 @@ import { Keypair, rpc } from '@stellar/stellar-sdk';
 import { contract as StellarContract } from '@stellar/stellar-sdk';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { marketSpec, perpetualSpec, factorySpec, vaultSpec } from './contracts';
+import { marketSpec, perpetualSpec, factorySpec, vaultSpec, mockRedstoneSpec } from './contracts';
 import type { OnChainMarket } from './market.types';
 import type { OnChainPerpetual } from './perpetual.types';
 
@@ -70,12 +70,51 @@ export interface CreateMarketParams {
   reflectorToleranceBps: number;
 }
 
+/** See `configuration.ts`'s `mockRedstoneContract` doc comment for why both legs are required together. */
+export interface PerpetualPriceOracleParams {
+  lazerContract: string;
+  feedId: number;
+  reflectorContract: string;
+  reflectorAsset: string;
+  reflectorMaxStalenessSecs: bigint;
+  reflectorToleranceBps: number;
+  redstoneContract: string;
+  /** RedStone's real wrapper keys XLM under `Asset::Stellar(<native XLM SAC>)`, not `Asset::Other` like Reflector — see `polaris-contracts/README.md`'s "A third oracle: RedStone". The mock reuses this same encoding for fidelity, even though it doesn't actually gate on the asset value. */
+  nativeXlmSac: string;
+  redstoneMaxStalenessSecs: bigint;
+  redstoneToleranceBps: number;
+}
+
 export interface CreatePerpetualParams {
   baseFeeBps: number;
   minFeeBps: number;
   treasury: string;
   initialLiquidityStroops: bigint;
   collateralAsset: string;
+  /** `undefined` → `price_oracle: None`, same as every perpetual this backend deployed before this existed. */
+  priceOracle?: PerpetualPriceOracleParams;
+}
+
+/** The `--price_oracle` CLI arg for `deployPerpetual`'s `initialize` call — a JSON-encoded `Some(PriceOracleConfig)`. `reflector_decimals_at_init`/`redstone_decimals_at_init` are placeholders (`initialize` overwrites them with a live `decimals()` reading from each oracle regardless — see `PriceOracleConfig`'s doc comment in `polaris-contracts`). */
+export function buildPriceOracleArg(params: PerpetualPriceOracleParams): string {
+  return JSON.stringify({
+    lazer_contract: params.lazerContract,
+    feed_id: params.feedId,
+    reflector: {
+      contract: params.reflectorContract,
+      asset: { Other: params.reflectorAsset },
+      max_staleness_secs: Number(params.reflectorMaxStalenessSecs),
+      tolerance_bps: params.reflectorToleranceBps,
+    },
+    reflector_decimals_at_init: 0,
+    redstone: {
+      contract: params.redstoneContract,
+      asset: { Stellar: params.nativeXlmSac },
+      max_staleness_secs: Number(params.redstoneMaxStalenessSecs),
+      tolerance_bps: params.redstoneToleranceBps,
+    },
+    redstone_decimals_at_init: 0,
+  });
 }
 
 /**
@@ -203,6 +242,18 @@ export class StellarService {
 
   private perpetualClient(contractId: string) {
     return new StellarContract.Client(perpetualSpec, {
+      contractId,
+      networkPassphrase: this.networkPassphrase,
+      rpcUrl: this.rpcUrl,
+      allowHttp: this.rpcUrl.startsWith('http://'),
+      publicKey: this.keypair.publicKey(),
+      signTransaction: this.keypair as unknown as StellarContract.ClientOptions['signTransaction'],
+      server: this.server,
+    });
+  }
+
+  private mockRedstoneClient(contractId: string) {
+    return new StellarContract.Client(mockRedstoneSpec, {
       contractId,
       networkPassphrase: this.networkPassphrase,
       rpcUrl: this.rpcUrl,
@@ -346,6 +397,36 @@ export class StellarService {
       server: this.server,
     });
     const tx = await this.withRpcRetry(() => (client as any).terminate({ admin: this.deployerKeypair.publicKey() }));
+    const sent = await tx.signAndSend();
+    return sent.sendTransactionResponse?.hash ?? sent.getTransactionResponse?.txHash ?? '';
+  }
+
+  /**
+   * Pokes `polaris-mock-redstone` (see `polaris-contracts/README.md`) with
+   * a fresh price before a checkpoint attempt — unlike Reflector's real
+   * testnet oracle (which updates itself on its own ~300s cadence), this
+   * mock only ever returns whatever was last set, so whoever exercises
+   * `record_price_checkpoint` owns keeping it fresh. `decimals` must match
+   * whatever the mock's own `decimals()` currently reports (defaults to 8,
+   * matching the real RedStone wrapper's live-confirmed value — see that
+   * README section) — a mismatch here doesn't corrupt anything on-chain
+   * (the contract always re-reads `decimals()` itself), it would just make
+   * the *price value* wrong by a power of 10, which the divergence check
+   * against Lazer would then correctly reject.
+   */
+  async refreshMockRedstonePrice(contractId: string, priceCents: bigint, decimals = 8): Promise<string> {
+    const client = this.mockRedstoneClient(contractId);
+    const price = priceCents * 10n ** BigInt(decimals - 2);
+    const timestamp = BigInt(Math.floor(Date.now() / 1000));
+    const tx = await this.withRpcRetry(() => (client as any).set_price({ price, timestamp }));
+    const sent = await tx.signAndSend();
+    return sent.sendTransactionResponse?.hash ?? sent.getTransactionResponse?.txHash ?? '';
+  }
+
+  /** Permissionless at the contract level (see `record_price_checkpoint`'s own doc comment in `polaris-contracts`) — signed here by this process's own keypair purely because *some* account has to pay the fee, same as `settle`/`cancel`. */
+  async recordPriceCheckpoint(contractId: string, payload: Buffer): Promise<string> {
+    const client = this.perpetualClient(contractId);
+    const tx = await this.withRpcRetry(() => (client as any).record_price_checkpoint({ payload }));
     const sent = await tx.signAndSend();
     return sent.sendTransactionResponse?.hash ?? sent.getTransactionResponse?.txHash ?? '';
   }
@@ -640,7 +721,7 @@ export class StellarService {
       '--initial_liquidity',
       params.initialLiquidityStroops.toString(),
       '--price_oracle',
-      'null',
+      params.priceOracle ? buildPriceOracleArg(params.priceOracle) : 'null',
     ];
 
     try {

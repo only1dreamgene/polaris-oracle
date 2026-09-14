@@ -31,7 +31,7 @@ See [`polaris-contracts`](https://github.com/samuel2926i39-art/polaris-contracts
 
 ## Bugs found by pressure-testing this system
 
-Eleven real bugs surfaced by deliberately trying to break this system after
+Twelve real bugs surfaced by deliberately trying to break this system after
 it was "done," not just written once and left. Recorded here because each
 one is the kind of thing that looks fine in a code read and only shows up
 under adversarial pressure or a real failure:
@@ -262,6 +262,21 @@ Worth knowing if you add a new sponsorable function that charges a fee:
 from anything structural, so a function silently gets skipped rather than
 erroring if you forget (the same "quiet, not loud" failure shape as bug 1).
 
+12. **`POST /perpetuals/:id/checkpoint` let `OracleService.waitForUpdate`'s
+    rejection propagate uncaught into a bare 500**, instead of the clean
+    4xx every other admin action returns. Found live, immediately, the
+    first real call in this dev environment (no `PYTH_LAZER_TOKEN`
+    configured — same known limitation `MarketService.trySettle` already
+    has, see below): `curl`'d the endpoint, got `{"statusCode":500,
+    "message":"Internal server error"}` with the real cause only visible
+    in the server log. Unlike `trySettle`, there's no fallback action to
+    take when the oracle is unavailable (checkpointing is purely
+    informational — nothing to cancel toward), so the fix is a plain
+    `isAvailable` check plus a try/catch around `waitForUpdate`, both
+    mapped to `BadRequestException` with the real reason in the message.
+    Re-verified live afterward: the same call now returns a clean 400
+    explaining exactly why (`PYTH_LAZER_TOKEN not configured?`).
+
 Worth knowing if you add a new on-chain read: `contract.Spec` preserves the
 Rust struct's exact field names (snake_case) and represents enums as
 `{ tag: 'Open' }` rather than a bare string — it does **not** camelCase
@@ -446,14 +461,33 @@ compiled `contract.Spec` to encode arguments against
 logic at all; `wire-args.ts`'s `buildSponsoredCallArgs` was already
 spec-agnostic.
 
-**`price_oracle` is unconditionally `None` for every perpetual this
-backend deploys.** `record_price_checkpoint` (the contract's permissionless,
-zero-economic-effect price observation) is consequently not exposed as an
-endpoint here at all — wiring a real Lazer+Reflector[+RedStone] bundle
-into perpetual deployment is explicitly deferred (see
-`polaris-contracts/README.md`'s "A third oracle: RedStone", which is
-mainnet-only regardless, so this backend — testnet-only today — has
-nothing to point it at yet).
+**`price_oracle` is a real Lazer + Reflector + RedStone bundle when all
+three are configured, `None` otherwise.** Follow-up round: RedStone has no
+testnet deployment (mainnet-only — see `polaris-contracts/README.md`'s
+"A third oracle: RedStone"), and `contracts/perpetual`'s `PriceOracleConfig`
+requires *both* the Reflector and RedStone legs together whenever
+`price_oracle` is configured at all — no Reflector-only option. That made
+`record_price_checkpoint` genuinely unexercisable on testnet, not just
+unwired. `polaris-contracts/contracts/mock-redstone` (a bare SEP-40-shaped
+stand-in, same "mock the third-party interface" shape as
+`contracts/mock-lazer`) closes this: `MOCK_REDSTONE_CONTRACT` configured
+alongside the existing `LAZER_CONTRACT`/`REFLECTOR_CONTRACT` makes
+`PerpetualController.buildPriceOracleParams` wire a full bundle into every
+newly-created perpetual (`stellar.service.ts`'s `buildPriceOracleArg`,
+mirroring `buildReflectorConfigArg`'s shape); leaving any of the three
+unset keeps `price_oracle: None`, exactly as before this existed.
+
+`POST /perpetuals/:id/checkpoint` (admin-gated, though `record_price_checkpoint`
+itself is permissionless at the contract level — *some* account still has
+to sign and pay for the call) refreshes the mock RedStone leg with a real
+price (`StellarService.refreshMockRedstonePrice`) — unlike Reflector's
+real testnet oracle, which updates itself on its own ~300s cadence, this
+mock only ever returns whatever was last set — then calls
+`record_price_checkpoint` with a real signed Lazer payload via the same
+`OracleService.waitForUpdate` path `MarketService.trySettle` already uses,
+so it degrades the same way (a clean 400 without a real
+`PYTH_LAZER_TOKEN` — see bug 12 below for the version of this that
+*didn't* degrade cleanly at first).
 
 **Admin dashboard**: `GET /admin/overview` reports `totalPerpetuals`/
 `perpetualsByStatus` as separate top-level fields, not merged into
@@ -470,7 +504,10 @@ force-fit into it.
 
 **Live-verified end-to-end through the real API** (not direct CLI calls):
 `POST /perpetuals/create` deployed and initialized a real testnet
-contract; a `buy` then a `sell` through `POST /auth/email/trade` (with
+contract, this time with a genuine `price_oracle` bundle attached
+(`GET .../state`'s `get_price_oracle` read back both legs' pinned
+`decimals_at_init` correctly — 14 for the real Reflector, 8 for the mock);
+a `buy` then a `sell` through `POST /auth/email/trade` (with
 `contractKind: 'perpetual'`) round-tripped correctly (pool/position
 math confirmed via `GET /perpetuals/:id/state`/`position`); `POST
 /perpetuals/:id/terminate` wound it down; a final `redeem` paid out and
@@ -478,6 +515,25 @@ drained the position to zero. `GET /admin/overview` and `/admin/fee-revenue`
 confirmed the dashboard picked up all of it correctly (`totalPerpetuals`,
 `perpetualsByStatus`, and a nonzero fee-revenue row for the trade) — which
 is also what caught bug 11 above.
+
+The checkpoint path itself was verified in two halves, since this dev
+environment has no `PYTH_LAZER_TOKEN` (see bug 12): `POST
+/perpetuals/:id/checkpoint` correctly returns a clean 400 explaining why
+under that constraint — proving the endpoint's own error handling, not the
+oracle logic. The oracle logic itself (unanimous corroboration, not just
+"wired up") was verified directly against the real contracts on testnet,
+bypassing the token-gated `OracleService`: a hand-built Lazer payload
+agreeing with both the real Reflector and the freshly-set mock RedStone
+succeeded and recorded the checkpoint (confirmed via this backend's own
+`GET /perpetuals/:id/state` afterward — `lastPriceCents`/`lastPriceAt`
+updated, pools/`totalSupply` untouched); a second attempt with the mock
+deliberately set to a wildly different price than Lazer's — while
+Reflector still agreed with Lazer — correctly rejected with
+`OracleDivergence`, and the perpetual's checkpoint fields were confirmed
+unchanged afterward. That's the specific property this whole design
+exists for (unanimous, not 2-of-3 majority — see
+`polaris-contracts/README.md`'s "A third oracle: RedStone"), proven live,
+not just asserted in a unit test.
 
 ## Off-chain multi-oracle settlement cross-check (Pyth-internal)
 
@@ -608,7 +664,7 @@ alone would be structurally wrong, not just approximate.
 cp .env.example .env   # fill in ORACLE_SECRET_KEY, ADMIN_API_KEY at minimum
 npm install
 npm run start:dev      # http://localhost:3001
-npm test                # 115 unit tests
+npm test                # 118 unit tests
 ```
 
 `ORACLE_SECRET_KEY` is the only hard requirement to boot — everything else
@@ -629,8 +685,16 @@ permissionless `cancel` at grace expiry instead of settling; no admin key
 - No test framework verification of the auth-relay's live submission path
   (see above) — the parts that don't need a network (ScVal construction,
   request validation) are covered; the RPC round-trip isn't.
-- Every perpetual this backend deploys has `price_oracle` unconditionally
-  `None` — `record_price_checkpoint` isn't exposed as an endpoint at all
-  yet (see "Perpetual markets" above). Wiring a real Lazer+Reflector
-  bundle in, and RedStone visibility in the admin dashboard generally, are
-  both deliberately deferred follow-ups, not implemented here.
+- The RedStone leg every perpetual's `price_oracle` bundle now includes is
+  `polaris-mock-redstone` (see "Perpetual markets" above) — a deliberate
+  testnet stand-in, not real RedStone data. Fine for exercising the
+  verification logic (which doesn't care where a leg's data comes from,
+  only that it's a genuine, independently-queried contract), but the
+  *checkpoint's actual price* isn't corroborated by real RedStone
+  infrastructure until a mainnet deployment happens. RedStone visibility
+  in the admin dashboard (a "2 vs 3 oracles configured" indicator,
+  extending `/admin/settlement-checks`' existing two-oracle display to a
+  third leg) is still a deferred follow-up, not implemented here.
+- `POST /perpetuals/:id/checkpoint` is admin-triggered, not scheduled —
+  nothing calls it automatically. A perpetual's `lastPriceCents`/
+  `lastPriceAt` stays `0`/never-updated until an admin calls it by hand.

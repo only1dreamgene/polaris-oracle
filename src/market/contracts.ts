@@ -21,9 +21,12 @@ export const PERPETUAL_WASM = loadWasm('polaris_perpetual.wasm');
 export const SMART_WALLET_FACTORY_WASM = loadWasm('polaris_smart_wallet_factory.wasm');
 export const SMART_WALLET_WASM = loadWasm('polaris_smart_wallet.wasm');
 export const VAULT_WASM = loadWasm('polaris_vault.wasm');
+/** Testnet-only stand-in for RedStone's real (mainnet-only) SEP-40 wrapper — see `polaris-contracts/README.md`'s `contracts/mock-redstone` row. Needed to write to (`set_price`), same as `MARKET_WASM`'s sibling read/write clients below — never deployed to mainnet. */
+export const MOCK_REDSTONE_WASM = loadWasm('polaris_mock_redstone.wasm');
 
 export const marketSpec = contract.Spec.fromWasm(MARKET_WASM);
 export const perpetualSpec = contract.Spec.fromWasm(PERPETUAL_WASM);
 export const factorySpec = contract.Spec.fromWasm(SMART_WALLET_FACTORY_WASM);
 export const smartWalletSpec = contract.Spec.fromWasm(SMART_WALLET_WASM);
 export const vaultSpec = contract.Spec.fromWasm(VAULT_WASM);
+export const mockRedstoneSpec = contract.Spec.fromWasm(MOCK_REDSTONE_WASM);

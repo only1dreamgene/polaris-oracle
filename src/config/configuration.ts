@@ -97,6 +97,20 @@ export interface AppConfig {
   marketFactoryBaseFeeBps: number;
   marketFactoryMinFeeBps: number;
   marketFactoryInitialLiquidityStroops: string;
+  /**
+   * `contracts/perpetual`'s `price_oracle` bundle requires *both* the
+   * Reflector and RedStone legs whenever it's configured at all (see
+   * `polaris-contracts/README.md`'s "A third oracle: RedStone") —
+   * RedStone has no testnet deployment, so `mockRedstoneContract` points
+   * at `polaris-mock-redstone` (also see that README) as its stand-in.
+   * `perpetualPriceOracle` stays `undefined` (and every perpetual this
+   * backend deploys keeps `price_oracle: None`, as before) unless *all*
+   * of `lazerContract`/`reflectorContract`/`mockRedstoneContract` are
+   * configured — no half-wired bundle gets passed to `initialize`.
+   */
+  mockRedstoneContract: string | undefined;
+  redstoneMaxStalenessSecs: string;
+  redstoneToleranceBps: number;
 }
 
 import { randomBytes } from 'node:crypto';
@@ -221,4 +235,7 @@ export default (): AppConfig => ({
   marketFactoryBaseFeeBps: Number(process.env.MARKET_FACTORY_BASE_FEE_BPS ?? 100),
   marketFactoryMinFeeBps: Number(process.env.MARKET_FACTORY_MIN_FEE_BPS ?? 20),
   marketFactoryInitialLiquidityStroops: process.env.MARKET_FACTORY_INITIAL_LIQUIDITY_STROOPS ?? '1000000000', // 100 XLM
+  mockRedstoneContract: process.env.MOCK_REDSTONE_CONTRACT,
+  redstoneMaxStalenessSecs: process.env.REDSTONE_MAX_STALENESS_SECS ?? '600',
+  redstoneToleranceBps: Number(process.env.REDSTONE_TOLERANCE_BPS ?? 150),
 });
