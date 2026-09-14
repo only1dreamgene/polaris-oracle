@@ -21,6 +21,16 @@ import { CreatePerpetualDto } from './dto/create-perpetual.dto';
 export class PerpetualController {
   private readonly logger = new Logger(PerpetualController.name);
 
+  /**
+   * Serializes `checkpoint()` calls within this process — see that
+   * method's doc comment for the race it closes. A resolved promise this
+   * process chains onto rather than a real mutex library: the lock only
+   * ever needs to order *this backend's own* async calls one after
+   * another, never block across processes, so a bare promise chain is
+   * enough.
+   */
+  private checkpointQueue: Promise<unknown> = Promise.resolve();
+
   constructor(
     private readonly perpetuals: PerpetualService,
     private readonly stellar: StellarService,
@@ -126,11 +136,39 @@ export class PerpetualController {
    * request cleanly with a clear message instead of silently no-oping or
    * (the bug this fixes, caught live) letting the rejection propagate
    * uncaught into a bare 500.
+   *
+   * The refresh-then-record sequence is two *separate* on-chain
+   * transactions, not one atomic call — `record_price_checkpoint` reads
+   * the mock's *live* state at its own execution time, not a snapshot
+   * from the refresh. `mockRedstoneContract` is one shared config value
+   * used by every perpetual this backend creates, and its `set_price` is
+   * deliberately unauthenticated (any testnet account can call it — see
+   * that contract's own doc comment), so a second `checkpoint()` call
+   * (this backend racing itself — two admin tabs, a double-click) landing
+   * between this call's two transactions would silently corrupt this
+   * call's result with an unrelated price, surfacing as a confusing
+   * `OracleDivergence` caused by a caller that was never even checkpointing
+   * this perpetual. `checkpointQueue` closes the "this backend races
+   * itself" case by serializing every `checkpoint()` call process-wide.
+   * It can NOT close the remaining "a third party pokes the shared mock
+   * directly, off this backend entirely" window — the mock's own
+   * unauthenticated-by-design nature makes that structurally impossible
+   * to prevent from here; stated plainly rather than pretended away (see
+   * `polaris-oracle/README.md`'s "Perpetual markets" section).
    */
   @Post(':id/checkpoint')
   @UseGuards(AdminGuard)
   @HttpCode(200)
-  async checkpoint(@Param('id') id: string) {
+  checkpoint(@Param('id') id: string) {
+    const next = this.checkpointQueue.then(() => this.doCheckpoint(id), () => this.doCheckpoint(id));
+    // Swallow this attempt's own rejection from the queue chain itself —
+    // otherwise an unhandled rejection warning fires even though the
+    // caller (below) does see and handle the real error via `next`.
+    this.checkpointQueue = next.catch(() => undefined);
+    return next;
+  }
+
+  private async doCheckpoint(id: string) {
     const mockRedstoneContract = this.config.get<string>('mockRedstoneContract');
     if (!mockRedstoneContract) {
       throw new BadRequestException('MOCK_REDSTONE_CONTRACT must be configured to checkpoint a perpetual');

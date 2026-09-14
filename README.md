@@ -31,7 +31,7 @@ See [`polaris-contracts`](https://github.com/samuel2926i39-art/polaris-contracts
 
 ## Bugs found by pressure-testing this system
 
-Twelve real bugs surfaced by deliberately trying to break this system after
+Thirteen real bugs surfaced by deliberately trying to break this system after
 it was "done," not just written once and left. Recorded here because each
 one is the kind of thing that looks fine in a code read and only shows up
 under adversarial pressure or a real failure:
@@ -276,6 +276,40 @@ erroring if you forget (the same "quiet, not loud" failure shape as bug 1).
     mapped to `BadRequestException` with the real reason in the message.
     Re-verified live afterward: the same call now returns a clean 400
     explaining exactly why (`PYTH_LAZER_TOKEN not configured?`).
+
+13. **`checkpoint()`'s refresh-then-record sequence was racy against
+    itself.** It's two *separate* on-chain transactions — `refreshMockRedstonePrice`
+    then `recordPriceCheckpoint` — not one atomic call, and
+    `record_price_checkpoint` reads `polaris-mock-redstone`'s *live* state
+    at its own execution time, not a snapshot from the refresh moments
+    earlier. `mockRedstoneContract` is one shared config value used by
+    *every* perpetual this backend creates, and the mock's `set_price` is
+    deliberately unauthenticated (any testnet account can call it — that's
+    the whole point of a mock, see its own doc comment in
+    `polaris-contracts`). Two admin tabs (or a double-click) calling
+    `checkpoint()` for two *different* perpetuals close together could
+    land B's refresh in the gap between A's refresh and A's record — A's
+    `record_price_checkpoint` would then compare its own Lazer payload
+    against B's price instead of its own, surfacing as a confusing
+    `OracleDivergence` for a request that never actually diverged from
+    anything. Found during a dedicated audit pass (not live — this dev
+    environment has no `PYTH_LAZER_TOKEN`/network access to reproduce it
+    against real testnet), by tracing the two-transaction sequence against
+    the mock's own "unauthenticated by design" doc comment. Fixed with
+    `checkpointQueue`, a per-process promise
+    chain that serializes every `checkpoint()` call — closes the "this
+    backend races itself" case, which is the realistic trigger. Regression
+    test: `perpetual.controller.checkpoint-race.spec.ts` (confirmed it
+    actually fails without the fix, not just that it passes with it — the
+    same "prove it reproduces" bar every other entry here holds to).
+    **What this does NOT close, stated plainly rather than glossed over**:
+    a third party calling `set_price` on the shared mock directly, from
+    outside this backend entirely, during the same window — the mock's
+    unauthenticated-by-design nature makes that structurally impossible to
+    prevent from this backend's side. Acceptable for what this mock
+    exists for (exercising the verification logic on testnet, see
+    "Perpetual markets" below) but worth knowing if `checkpoint()`
+    ever needs to be trusted against a genuinely adversarial testnet.
 
 Worth knowing if you add a new on-chain read: `contract.Spec` preserves the
 Rust struct's exact field names (snake_case) and represents enums as
@@ -664,7 +698,7 @@ alone would be structurally wrong, not just approximate.
 cp .env.example .env   # fill in ORACLE_SECRET_KEY, ADMIN_API_KEY at minimum
 npm install
 npm run start:dev      # http://localhost:3001
-npm test                # 118 unit tests
+npm test                # 120 unit tests
 ```
 
 `ORACLE_SECRET_KEY` is the only hard requirement to boot — everything else
