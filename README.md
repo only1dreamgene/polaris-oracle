@@ -31,7 +31,7 @@ See [`polaris-contracts`](https://github.com/samuel2926i39-art/polaris-contracts
 
 ## Bugs found by pressure-testing this system
 
-Thirteen real bugs surfaced by deliberately trying to break this system after
+Fourteen real bugs surfaced by deliberately trying to break this system after
 it was "done," not just written once and left. Recorded here because each
 one is the kind of thing that looks fine in a code read and only shows up
 under adversarial pressure or a real failure:
@@ -310,6 +310,26 @@ erroring if you forget (the same "quiet, not loud" failure shape as bug 1).
     exists for (exercising the verification logic on testnet, see
     "Perpetual markets" below) but worth knowing if `checkpoint()`
     ever needs to be trusted against a genuinely adversarial testnet.
+14. **The Dockerfile's `CMD` pointed at a build output path that never
+    existed.** `CMD ["node", "dist/src/main"]` — but `nest-cli.json`'s
+    `sourceRoot: "src"` makes tsc treat `src` itself as the effective
+    rootDir, so `nest build` emits flat (`dist/main.js`), never
+    `dist/src/main.js`. Nobody had ever actually run this image before:
+    local dev only ever used `npm start`/`npm run build` directly, neither
+    of which touches the container's `CMD`, so the drift shipped invisibly
+    until a real deploy (first-ever Fly.io deploy of this repo) crash-looped
+    on `Cannot find module '/app/dist/src/main'`. Fixed by pointing `CMD`
+    at `dist/main`. Regression test: `src/dockerfile-entrypoint.spec.ts`
+    — runs the real `npm run build` and asserts the file `CMD` names is
+    what actually comes out (confirmed it fails against the old path,
+    passes against the fix). **That test had to be moved mid-writing**: a
+    first draft placed it at the repo root, which itself changed tsc's
+    inferred rootDir back to the repo root (no longer just `src/**`) and
+    flipped the build to nest everything under `dist/src/` — silently
+    recreating the exact bug this test exists to catch, just pointed the
+    other way. Caught by rerunning the revert/restore check and noticing
+    the "broken" CMD path now passed. Moved into `src/` alongside every
+    other spec file in this repo, which keeps rootDir inference untouched.
 
 Worth knowing if you add a new on-chain read: `contract.Spec` preserves the
 Rust struct's exact field names (snake_case) and represents enums as
@@ -698,7 +718,7 @@ alone would be structurally wrong, not just approximate.
 cp .env.example .env   # fill in ORACLE_SECRET_KEY, ADMIN_API_KEY at minimum
 npm install
 npm run start:dev      # http://localhost:3001
-npm test                # 120 unit tests
+npm test                # 121 unit tests
 ```
 
 `ORACLE_SECRET_KEY` is the only hard requirement to boot — everything else
