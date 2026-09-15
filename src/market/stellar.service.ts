@@ -5,6 +5,7 @@ import { contract as StellarContract } from '@stellar/stellar-sdk';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { marketSpec, perpetualSpec, factorySpec, vaultSpec, mockRedstoneSpec } from './contracts';
+import { hermesPriceToCents } from './pyth-price';
 import type { OnChainMarket } from './market.types';
 import type { OnChainPerpetual } from './perpetual.types';
 
@@ -660,6 +661,54 @@ export class StellarService {
       );
       return { contractId, initTxHash: '' };
     }
+  }
+
+  /**
+   * Reads Reflector Network's own current price directly on-chain,
+   * bypassing Pyth's Hermes HTTP API entirely. Added after Hermes' public
+   * `hermes.pyth.network` started rejecting every `/v2/updates/price/latest`
+   * request with a bare 401, for every feed and every endpoint variant
+   * tried — confirmed live, from multiple networks, that this is a global
+   * change on Pyth's hosted instance and not something wrong with this
+   * backend's own request (see `MarketFactoryService.createMarketFor`'s
+   * doc comment for where this is used as the fallback). Reflector is
+   * already a trusted, no-API-key dependency for on-chain settlement
+   * corroboration, so it doubles as the off-chain strike-price source too
+   * rather than wiring in a third provider just for this. Uses the same
+   * CLI shell-out this class already uses for deploys (see `deployMarket`'s
+   * doc comment for why that path isn't reimplemented via `contract.Client`
+   * — the same reasoning applies here: no local wasm for an external
+   * contract to build a typed `contract.Spec` from, and the CLI's own
+   * `--asset`/JSON argument encoding is already proven correct against
+   * this exact contract elsewhere in this codebase).
+   */
+  async getReflectorPriceCents(reflectorContract: string, asset: string): Promise<bigint> {
+    const network = this.config.get<string>('stellarNetwork')!;
+    const baseArgs = [
+      'contract',
+      'invoke',
+      '--id',
+      reflectorContract,
+      '--source',
+      this.deployerSecretKey,
+      '--network',
+      network,
+      '--rpc-url',
+      this.rpcUrl,
+      '--network-passphrase',
+      this.networkPassphrase,
+      '--',
+    ];
+    const [priceRes, decimalsRes] = await Promise.all([
+      this.execStellarCli([...baseArgs, 'lastprice', '--asset', JSON.stringify({ Other: asset })]),
+      this.execStellarCli([...baseArgs, 'decimals']),
+    ]);
+    const priceData = JSON.parse(priceRes.stdout.trim()) as { price: string; timestamp: number } | null;
+    if (!priceData) throw new Error(`Reflector returned no price for asset ${asset}`);
+    const decimals = Number(decimalsRes.stdout.trim());
+    // Same {price, expo} shape hermesPriceToCents already converts —
+    // Reflector's price is priceData.price * 10^-decimals, i.e. expo = -decimals.
+    return hermesPriceToCents(priceData.price, -decimals);
   }
 
   /**

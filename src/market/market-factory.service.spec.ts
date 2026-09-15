@@ -137,6 +137,33 @@ describe('MarketFactoryService — run()', () => {
     expect(result.failed).toEqual([]);
   });
 
+  it('falls back to Reflector for a strike price when Hermes fails, instead of failing the whole feed', async () => {
+    // Regression for a real bug found live: Pyth's public Hermes endpoint
+    // started rejecting every price request with a bare 401 (confirmed
+    // global, not feed-specific), which would otherwise have silently
+    // blocked market creation forever — see StellarService.getReflectorPriceCents's
+    // doc comment. Strike price is an estimate the factory picks, not
+    // something settlement correctness depends on, so falling back to the
+    // already-trusted Reflector dependency is safe.
+    const repo = makeRepo([]);
+    const markets = makeMarkets();
+    const stellar = {
+      vaultWithdraw: jest.fn().mockResolvedValue('WITHDRAWTX'),
+      deployMarket: jest.fn().mockResolvedValue({ contractId: 'CNEWMARKET', initTxHash: 'INITTX' }),
+      getReflectorPriceCents: jest.fn().mockResolvedValue(19n),
+    };
+    const config = makeConfig();
+    mockHermesFetch('error');
+
+    const svc = new MarketFactoryService(repo, markets, stellar as any, config, new MarketEvents(), makeActivity());
+    const result = await svc.run();
+
+    expect(stellar.getReflectorPriceCents).toHaveBeenCalledWith('CREFLECTOR', 'XLM');
+    expect(stellar.deployMarket).toHaveBeenCalledWith(expect.objectContaining({ strikePriceCents: 19n }));
+    expect(result.created).toEqual([{ symbol: 'XLM/USD', contractId: 'CNEWMARKET', strikePriceCents: '19' }]);
+    expect(result.failed).toEqual([]);
+  });
+
   it('a vault-withdrawal failure fails that feed loudly and does not deploy an underfunded market', async () => {
     const repo = makeRepo([]);
     const markets = makeMarkets();
@@ -156,12 +183,21 @@ describe('MarketFactoryService — run()', () => {
     expect(result.created).toEqual([]);
   });
 
-  it('a bad Hermes lookup fails that feed independently and does not block the rest of the catalog', async () => {
+  it('a bad Hermes lookup for one feed falls back to Reflector for that feed alone, and does not disturb a feed whose Hermes lookup succeeds', async () => {
+    // Was "...fails that feed independently..." before the Hermes-401
+    // fallback above existed — a bad Hermes lookup no longer fails a feed
+    // at all, so this now asserts both feeds still succeed independently,
+    // each via its own price source.
     const repo = makeRepo([]);
     const markets = makeMarkets();
+    let deployCall = 0;
     const stellar = {
       vaultWithdraw: jest.fn().mockResolvedValue('WITHDRAWTX'),
-      deployMarket: jest.fn().mockResolvedValue({ contractId: 'CBTC', initTxHash: 'INITTX' }),
+      deployMarket: jest.fn().mockImplementation(async () => {
+        deployCall++;
+        return { contractId: deployCall === 1 ? 'CXLM' : 'CBTC', initTxHash: 'INITTX' };
+      }),
+      getReflectorPriceCents: jest.fn().mockResolvedValue(19n),
     };
     const config = makeConfig({ feedCatalog: [XLM_ENTRY, BTC_ENTRY] });
 
@@ -178,8 +214,13 @@ describe('MarketFactoryService — run()', () => {
     const svc = new MarketFactoryService(repo, markets, stellar as any, config, new MarketEvents(), makeActivity());
     const result = await svc.run();
 
-    expect(result.failed).toEqual([{ symbol: 'XLM/USD', error: 'Hermes price lookup failed: 503' }]);
-    expect(result.created).toEqual([{ symbol: 'BTC/USD', contractId: 'CBTC', strikePriceCents: '5000000' }]);
+    expect(result.failed).toEqual([]);
+    expect(result.created).toEqual(
+      expect.arrayContaining([
+        { symbol: 'XLM/USD', contractId: 'CXLM', strikePriceCents: '19' },
+        { symbol: 'BTC/USD', contractId: 'CBTC', strikePriceCents: '5000000' },
+      ]),
+    );
   });
 
   it('surfaces missing config as a per-feed failure rather than throwing out of run()', async () => {

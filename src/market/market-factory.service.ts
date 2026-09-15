@@ -158,8 +158,7 @@ export class MarketFactoryService implements OnModuleInit, OnModuleDestroy {
       );
     }
 
-    const hermesUrl = this.config.get<string>('pythHermesUrl')!;
-    const strikePriceCents = await fetchHermesPriceCents(hermesUrl, entry.hermesFeedId);
+    const strikePriceCents = await this.fetchStrikePriceCents(entry, reflectorContract);
     const now = Math.floor(Date.now() / 1000);
     const expiry = now + this.config.get<number>('marketFactoryExpirySecs')!;
     const gracePeriodSecs = this.config.get<number>('marketFactoryGracePeriodSecs')!;
@@ -216,5 +215,34 @@ export class MarketFactoryService implements OnModuleInit, OnModuleDestroy {
 
     this.logger.log(`factory created market ${contractId} for ${entry.symbol} (strike ${strikePriceCents}c)`);
     return { contractId, strikePriceCents };
+  }
+
+  /**
+   * A real bug found live: Pyth's public `hermes.pyth.network` started
+   * rejecting every price request with a bare 401 (confirmed global, not
+   * feed- or endpoint-specific, and not specific to this deployment's
+   * network egress — see `StellarService.getReflectorPriceCents`'s doc
+   * comment). Since Hermes is only ever used here to *pick* a fresh
+   * market's strike price (an estimate, not something settlement
+   * correctness depends on — settlement verifies a signed Lazer payload
+   * against the contract's own on-chain Reflector check, never Hermes),
+   * this now tries Hermes first and falls back to reading Reflector's
+   * price directly on-chain if it fails, instead of letting the whole
+   * factory run for that feed fail. Reflector needs no API key and is
+   * already a trusted dependency for settlement corroboration, so it adds
+   * no new trust assumption. Every previous failure mode of Hermes itself
+   * (timeout, malformed response, missing catalog entry) still falls
+   * through to this same path unchanged.
+   */
+  private async fetchStrikePriceCents(entry: FeedCatalogEntry, reflectorContract: string): Promise<bigint> {
+    const hermesUrl = this.config.get<string>('pythHermesUrl')!;
+    try {
+      return await fetchHermesPriceCents(hermesUrl, entry.hermesFeedId);
+    } catch (err) {
+      this.logger.warn(
+        `Hermes price lookup failed for ${entry.symbol}, falling back to Reflector: ${(err as Error).message}`,
+      );
+      return this.stellar.getReflectorPriceCents(reflectorContract, this.config.get<string>('reflectorAsset')!);
+    }
   }
 }

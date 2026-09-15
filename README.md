@@ -202,7 +202,7 @@ header.
 cp .env.example .env   # fill in ORACLE_SECRET_KEY, ADMIN_API_KEY at minimum
 npm install
 npm run start:dev      # http://localhost:3001
-npm test                # 121 unit tests
+npm test                # 122 unit tests
 ```
 
 `ORACLE_SECRET_KEY` is the only hard requirement to boot — everything else
@@ -402,7 +402,7 @@ the trade, which isn't recoverable later.
 ## Bugs found by pressure-testing this system
 
 <details>
-<summary><strong>Fourteen real bugs</strong>, surfaced by deliberately trying to break this system after it was "done," not just written once and left. Click to expand.</summary>
+<summary><strong>Fifteen real bugs</strong>, surfaced by deliberately trying to break this system after it was "done," not just written once and left. Click to expand.</summary>
 
 1. **Every sponsored trade call was missing its own address.** `wireArgs`
    only ever carried what the frontend explicitly passed — the wallet's
@@ -504,6 +504,35 @@ the trade, which isn't recoverable later.
     rootDir and silently recreated the exact bug it was meant to catch, in
     the other direction — caught by rerunning the revert/restore check and
     noticing the "broken" path now passed.
+15. **The market factory could never actually create a market on a live
+    deployment — Pyth's public Hermes endpoint started requiring
+    authorization on every price-fetching call.** `hermes.pyth.network`'s
+    `/v2/updates/price/latest` began returning a bare `401 unauthorized`
+    for every request, confirmed live to be global — every feed id, every
+    endpoint variant (`/v2/updates/price/latest`, `/api/latest_price_feeds`),
+    from multiple networks, all 401; only the metadata/discovery endpoint
+    (`/v2/price_feeds`) still works unauthenticated. Found live on the
+    first real Fly.io deployment: the factory's 5-minute sweep logged
+    `Hermes price lookup failed: 401` in a tight loop from boot, and
+    `/markets` stayed permanently empty — nobody had exercised this path
+    against the real public Hermes instance since it started requiring
+    auth, since local dev always hit the same (now-broken) endpoint the
+    same way. Strike price is only ever an *estimate* the factory picks
+    for a fresh market, never something settlement correctness depends on
+    (settlement verifies a signed Lazer payload against the contract's own
+    on-chain Reflector check, never Hermes), so this now tries Hermes
+    first and falls back to a new `StellarService.getReflectorPriceCents`
+    — reading Reflector Network's own price directly on-chain, which needs
+    no API key and is already a trusted dependency for settlement
+    corroboration — instead of failing the whole feed. Regression test:
+    two cases in `market-factory.service.spec.ts` (a lone Hermes failure
+    now succeeds via the fallback; a mixed catalog where one feed's Hermes
+    call fails and another's succeeds, proving neither path disturbs the
+    other), both confirmed to fail against the pre-fix code and pass
+    against the fix. Verified live afterward: a real market
+    (`CDY746GOZPAQ7RBY6EYYQZPKYQ7V2O2GTKNLM337QXW4DSRCV4XRX5RT`) created
+    against the live Fly deployment with a strike price read straight from
+    Reflector's live testnet price.
 
 </details>
 
