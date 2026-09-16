@@ -95,6 +95,10 @@ export interface AppConfig {
   marketFactoryExpirySecs: number;
   marketFactoryGracePeriodSecs: number;
   marketFactoryBaseFeeBps: number;
+  /** How often `OddsSnapshotService` records each open market's odds — the resolution of the frontend's "Chg" column. */
+  oddsSnapshotIntervalSecs: number;
+  /** The lookback window `GET /markets/:id/price`'s `yesBpsChange` is computed against — see `OddsSnapshotRepository.closestBefore`. */
+  oddsChangeWindowSecs: number;
   marketFactoryMinFeeBps: number;
   marketFactoryInitialLiquidityStroops: string;
   /**
@@ -230,6 +234,8 @@ export default (): AppConfig => ({
   // well under marketFactoryGracePeriodSecs (1h default) bounds how long a
   // crash right after expiry could leave a feed dark.
   marketFactoryIntervalSecs: Number(process.env.MARKET_FACTORY_INTERVAL_SECS ?? 5 * 60),
+  oddsSnapshotIntervalSecs: Number(process.env.ODDS_SNAPSHOT_INTERVAL_SECS ?? 5 * 60),
+  oddsChangeWindowSecs: Number(process.env.ODDS_CHANGE_WINDOW_SECS ?? 60 * 60),
   marketFactoryExpirySecs: Number(process.env.MARKET_FACTORY_EXPIRY_SECS ?? 24 * 60 * 60), // 24 hours
   marketFactoryGracePeriodSecs: Number(process.env.MARKET_FACTORY_GRACE_PERIOD_SECS ?? 3600),
   marketFactoryBaseFeeBps: Number(process.env.MARKET_FACTORY_BASE_FEE_BPS ?? 100),

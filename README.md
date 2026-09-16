@@ -142,7 +142,7 @@ header.
 | `GET` | `/markets/:id` | — | Tracked market metadata |
 | `GET` | `/markets/:id/state` | — | Live on-chain state |
 | `GET` | `/markets/:id/position?address=` | — | A wallet's YES/NO share balances |
-| `GET` | `/markets/:id/price` | — | Current AMM-implied price |
+| `GET` | `/markets/:id/price` | — | Current AMM-implied price, plus `yesBpsChange` (real recorded history, `null` if none exists yet — see [Design notes](#design-notes)) |
 | `GET` | `/markets/:id/fee` | — | Current effective fee (bps) |
 | `POST` | `/markets/faucet` | — | Fund a testnet address (rate-limited) |
 | `POST` | `/markets/create` | admin | Deploy + initialize a new market |
@@ -202,7 +202,7 @@ header.
 cp .env.example .env   # fill in ORACLE_SECRET_KEY, ADMIN_API_KEY at minimum
 npm install
 npm run start:dev      # http://localhost:3001
-npm test                # 122 unit tests
+npm test                # 130 unit tests
 ```
 
 `ORACLE_SECRET_KEY` is the only hard requirement to boot — everything else
@@ -315,6 +315,35 @@ with correct on-chain wiring. Also verified the failure path: a
 vault-withdrawal failure during a live event-triggered roll was caught,
 logged with the real on-chain reason, and correctly produced no
 underfunded market.
+
+### Historical odds & the ticker "Chg" column
+
+`polaris-frontend`'s markets list shows each market as a ticker row —
+symbol, current YES/NO odds, and a real "Chg" figure. That last one needed
+actual history to exist, not just a UI mockup: `OddsSnapshotService`
+records every open classic market's odds on an interval
+(`ODDS_SNAPSHOT_INTERVAL_SECS`, default 5 minutes — same cadence as
+`MarketFactoryService`'s safety-net sweep) into a new `odds_snapshots`
+table (`OddsSnapshotRepository`, same SQLite file as everything else).
+
+`GET /markets/:id/price` reads the closest snapshot at or before
+`now - ODDS_CHANGE_WINDOW_SECS` (default 1 hour) and returns
+`yesBpsChange = currentYesBps - thatSnapshot.yesBps` alongside the current
+odds. **`null`, not `0`, when no snapshot exists that far back yet** — a
+market younger than the window, or a fresh deployment where the snapshot
+service hasn't run long enough — since `0` would claim "no movement,"
+a different and false claim from "nothing to compare against yet." The
+frontend renders that as a plain dash rather than a fabricated "+0%".
+
+Scoped to classic markets only for now, matching the ticker redesign it
+backs — perpetuals don't get a "Chg" column in this round (see
+[Known gaps](#known-gaps)). Its own timer, deliberately not folded into
+`MarketFactoryService`'s existing one: a factory failure and a snapshot
+failure are unrelated concerns, and coupling them would mean a factory
+bug could also silently stop odds history from being recorded. Bounded
+growth: snapshots older than 7 days are pruned on every run — comfortably
+longer than any market's real lifetime (expiry + grace period), so
+nothing a caller could still plausibly want is ever deleted.
 
 ### Perpetual markets
 
@@ -544,6 +573,9 @@ signature is `Result<T, Error>`, `tx.result` is `Ok`/`Err`, not `T` — call
 
 ## Known gaps
 
+- `OddsSnapshotService` only records classic markets — perpetuals don't
+  get a "Chg" figure yet. A follow-up would mirror the same
+  service/repository against `PerpetualService`/`PerpetualRepository`.
 - `POST /wallets/deploy` is still unauthenticated by design (self-service
   onboarding for a fresh passkey, which by definition has no address yet
   to key a limiter on) — but is now rate-limited per IP, mitigating rather

@@ -9,6 +9,8 @@ import { AdminController } from './admin.controller';
 import { MarketService } from './market.service';
 import { PerpetualService } from './perpetual.service';
 import { MarketFactoryService } from './market-factory.service';
+import { OddsSnapshotService } from './odds-snapshot.service';
+import { OddsSnapshotRepository } from './odds-snapshot.repository';
 import { MarketEvents } from './market-events';
 import { StellarService } from './stellar.service';
 import { OracleService } from './oracle.service';
@@ -29,6 +31,8 @@ import { EMAIL_SENDER, ConsoleEmailSender, ResendEmailSender } from './email-sen
     MarketService,
     PerpetualService,
     MarketFactoryService,
+    OddsSnapshotService,
+    OddsSnapshotRepository,
     MarketEvents,
     StellarService,
     OracleService,

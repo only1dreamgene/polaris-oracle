@@ -21,6 +21,7 @@ import { AdminGuard } from './admin.guard';
 import { CreateMarketDto } from './dto/create-market.dto';
 import { WatchMarketDto } from './dto/watch-market.dto';
 import { FaucetDto } from './dto/faucet.dto';
+import { OddsSnapshotRepository } from './odds-snapshot.repository';
 
 @Controller('markets')
 export class MarketController {
@@ -30,6 +31,7 @@ export class MarketController {
     private readonly stellar: StellarService,
     private readonly faucet: FaucetService,
     private readonly config: ConfigService,
+    private readonly oddsSnapshots: OddsSnapshotRepository,
   ) {}
 
   @Get()
@@ -62,9 +64,23 @@ export class MarketController {
     return { yes: yes.toString(), no: no.toString() };
   }
 
+  /**
+   * `yesBpsChange` is the real thing the frontend's ticker "Chg" column
+   * shows — computed against `OddsSnapshotService`'s recorded history, not
+   * fabricated. `null` (not `0`) when no snapshot exists far enough back
+   * yet (a market younger than `oddsChangeWindowSecs`, or the snapshot
+   * service hadn't run at all) — `0` would claim "no movement", which is
+   * a different, false, claim from "no history to compare against yet".
+   */
   @Get(':id/price')
   async price(@Param('id') id: string) {
-    return this.stellar.getPrice(id);
+    const current = await this.stellar.getPrice(id);
+    const windowSecs = this.config.get<number>('oddsChangeWindowSecs')!;
+    const past = this.oddsSnapshots.closestBefore(id, Date.now() - windowSecs * 1000);
+    return {
+      ...current,
+      yesBpsChange: past ? current.yesBps - past.yesBps : null,
+    };
   }
 
   @Get(':id/fee')
