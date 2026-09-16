@@ -53,6 +53,7 @@ The web app consuming this API is at
 - [Design notes](#design-notes)
 - [Bugs found by pressure-testing this system](#bugs-found-by-pressure-testing-this-system)
 - [Known gaps](#known-gaps)
+- [Contributing](#contributing)
 
 ## Features
 
@@ -592,6 +593,13 @@ signature is `Result<T, Error>`, `tx.result` is `Ok`/`Err`, not `T` — call
   nothing calls it automatically.
 - The live Fly deployment has no real `PYTH_LAZER_TOKEN` — see the caveat
   at the top of this document.
+
+## Contributing
+
+Peer review and testing are the most effective way to contribute to a
+project this size — see [CONTRIBUTING.md](./CONTRIBUTING.md) for the full
+process (adapted from Bitcoin Core's), including the higher review bar
+that applies to fund-safety-critical code.
 
 ## License
 
